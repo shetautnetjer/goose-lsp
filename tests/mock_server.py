@@ -64,7 +64,9 @@ while (message := read_message()) is not None:
         send({"jsonrpc": "2.0", "id": message["id"], "result": {"capabilities": {
             "textDocumentSync": 1, "implementationProvider": True}}}, fragment=True)
     elif method == "initialized":
-        notify("experimental/serverStatus", {"quiescent": True})
+        # "quiet" is a server that never reports its indexing (pyright, typescript).
+        if mode != "quiet":
+            notify("experimental/serverStatus", {"quiescent": True})
         if mode == "normal":
             child = subprocess.Popen([sys.executable, __file__, "child"])
             record("child", {"pid": child.pid})
@@ -75,6 +77,12 @@ while (message := read_message()) is not None:
         documents[doc["uri"]] = doc["text"]
     elif method == "textDocument/didChange":
         documents[params["textDocument"]["uri"]] = params["contentChanges"][0]["text"]
+    elif method == "textDocument/didSave" and mode == "quiet":
+        # The second save is the diagnostics question's: die while it waits.
+        saves = globals().get("saves", 0) + 1
+        if saves == 2:
+            record("exit", {"reason": "died during diagnostics"})
+            sys.exit(0)
     elif method == "textDocument/didSave":
         uri = params["textDocument"]["uri"]
         notify("$/progress", {"token": "flycheck-fixture", "value": {"kind": "begin"}})
@@ -88,10 +96,17 @@ while (message := read_message()) is not None:
         if mode == "die":
             record("exit", {"reason": "deliberate EOF"})
             sys.exit(0)
+        if mode == "quiet":
+            send({"jsonrpc": "2.0", "id": message["id"], "error": {"code": -32603, "message": "fixture failure"}})
+            continue
         response(message["id"], [
             {"uri": root + "/impl.ts", "range": {"start": {"line": 6, "character": 2}}},
             {"targetUri": root + "/linked.ts", "targetSelectionRange": {"start": {"line": 8, "character": 3}}},
             {"uri": "file:///outside/ignored.ts", "range": {"start": {"line": 0, "character": 0}}},
+            # A sibling folder whose name starts with the repo's: outside too.
+            {"uri": root + "-extra/ignored.ts", "range": {"start": {"line": 0, "character": 0}}},
+            # A name with a '#' and a space, percent-encoded as servers send it.
+            {"uri": root + "/a%23b%20c.ts", "range": {"start": {"line": 1, "character": 0}}},
         ])
     elif method == "shutdown":
         response(message["id"], None)

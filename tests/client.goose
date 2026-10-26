@@ -48,6 +48,14 @@ fn main() {
     ask("dead", "{\"op\":\"implementations\",\"file\":\"sample.ts\",\"line\":1,\"col\":1}");
     golsp_stop();
 
+    // A server that never reports indexing is not waited on; its error
+    // answer is an error; its death mid-question ends the question.
+    let quiet = server_args(a[2], a[3], "quiet", repo);
+    assert(golsp_start(repo, str(repo, "/quiet.log"), "{}", quiet, "", "typescript"));
+    ask("quiet-error", "{\"op\":\"implementations\",\"file\":\"sample.ts\",\"line\":1,\"col\":1}");
+    ask("quiet-dies", "{\"op\":\"diagnostics\",\"file\":\"sample.ts\",\"settle\":\"publish\"}");
+    golsp_stop();
+
     var absent: u8[>..] = [];
     absent.append(str(repo, "/no-such-server")); absent.push(0);
     assert(!golsp_start(repo, str(repo, "/absent.log"), "{}", absent, "", "typescript"));

@@ -38,18 +38,22 @@ def running(pid):
 
 
 try:
+    began = time.monotonic()
     result = subprocess.run([str(binary), str(fixture), sys.executable, str(mock)],
                             capture_output=True, text=True, timeout=25)
+    took = time.monotonic() - began
     (fixture / "client.stdout").write_text(result.stdout)
     (fixture / "client.stderr").write_text(result.stderr)
     require(result.returncode == 0, f"consumer exit {result.returncode}: {result.stderr}")
+    # Without the fixes the quiet server costs 180 s (indexing wait) and 120 s (spinning after death).
+    require(took < 15, f"the run took {took:.1f} s: something waited on a silent or dead server")
     answers = {}
     for line in result.stdout.splitlines():
         name, body = line.split("\t", 1)
         require(name not in answers, f"duplicate answer: {name}")
         answers[name] = json.loads(body)
     expected = {"malformed", "unknown", "missing-file", "missing-position", "first", "changed",
-                "implementations", "stopped", "death-request", "dead", "failed-start"}
+                "implementations", "stopped", "death-request", "dead", "failed-start", "quiet-error", "quiet-dies"}
     require(set(answers) == expected, f"missing or extra answers: {set(answers) ^ expected}")
     for name in ("malformed", "unknown", "missing-file", "missing-position"):
         require(answers[name].get("ok") is False and answers[name].get("error"), f"{name} must fail")
@@ -58,8 +62,12 @@ try:
             f"diagnostics conversion: {answers['first']}")
     require(answers["changed"] == {"ok": True, "diagnostics": []}, "changed file must clear old diagnostics")
     require(answers["implementations"] == {"ok": True, "locations": [
-        {"file": "impl.ts", "line": 7, "col": 3}, {"file": "linked.ts", "line": 9, "col": 4}]},
-        "Location/LocationLink conversion or external URI filtering")
+        {"file": "impl.ts", "line": 7, "col": 3}, {"file": "linked.ts", "line": 9, "col": 4},
+        {"file": "a#b c.ts", "line": 2, "col": 1}]},
+        "Location/LocationLink conversion, external and sibling URI filtering, URI decoding")
+    require(answers["quiet-error"] == {"ok": False, "error": "fixture failure"}, f"error response: {answers['quiet-error']}")
+    require(answers["quiet-dies"].get("ok") is False and answers["quiet-dies"].get("gone") is True,
+            f"server death during diagnostics: {answers['quiet-dies']}")
     require(answers["death-request"].get("ok") is False, "request interrupted by EOF must fail")
     for name in ("stopped", "dead", "failed-start"):
         require(answers[name].get("ok") is False and answers[name].get("gone") is True, f"{name} must report gone")
@@ -94,8 +102,9 @@ try:
     require(not running(process["pid"]) and not running(child), "stop must terminate server and child group")
     died = records("die")
     require(any(row == {"kind": "exit", "value": {"reason": "deliberate EOF"}} for row in died), "death fixture ran")
-    print("PASS goose-lsp standalone: 11 answers; initialization, configuration, framing, synchronization,")
-    print("diagnostics, implementations, graceful stop/group cleanup, EOF and failed executable.")
+    print("PASS goose-lsp standalone: 13 answers; initialization, configuration, framing, synchronization,")
+    print("diagnostics, implementations, graceful stop/group cleanup, EOF and failed executable,")
+    print("error answers, a server that never reports indexing, death during diagnostics.")
     print(f"Evidence: {fixture}")
 finally:
     # Only fixture-owned process groups, including when a consumer assertion fails.

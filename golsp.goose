@@ -41,6 +41,8 @@ var repo_dir: u8[..4096];
 var log_path: u8[..4096];
 var init_options: u8[>..];
 var indexing_done = false;
+var index_signals = false;      // the server reports its indexing (rust-analyzer does; pyright and typescript don't)
+var index_silent = false;       // it said nothing of indexing when first asked, so it never will
 var checking = 0;               // flycheck runs begun and not yet ended
 var language_id: u8[>..];       // what didOpen says the files are: rust, python, typescript
 var checks_ended = 0;
@@ -51,11 +53,12 @@ var trace = false;              // GOLSP_TRACE=1: every message from the server 
 // The latest diagnostics the server published for each file, as our JSON:
 // a file's set lives at diag_text[diag_at[uri]..][..diag_len[uri]]. The
 // server publishes only when a set changes, so an unchanged file is answered
-// from here. Older sets stay in diag_text until the session restarts.
+// from here. Older sets are compacted away (compact_diagnostics).
 var diag_text: u8[>..];
 var diag_at = dictionary<u8[..1024], i64> {};
 var diag_len = dictionary<u8[..1024], i64> {};
 var diag_seq = dictionary<u8[..1024], i64> {};  // which publish, counting from the session's start
+var diag_ver = dictionary<u8[..1024], i64> {};  // the document version a set is for, when the server says
 var publishes = 0;
 
 fn note(s: const u8[:]) { append_file(log_path, str(s, "\n")); }
@@ -211,7 +214,10 @@ fn pump<F>(timeout_ms: i64) -> bool {
             let token, t_ok = json::as_string(json::member(p, "token"));
             let kind, k_ok = json::as_string(json::member(json::member(p, "value"), "kind"));
             if t_ok && k_ok {
-                if (find(token, "ndexing") >= 0 || find(token, "cachePriming") >= 0) && kind == "end" { indexing_done = true; }
+                if find(token, "ndexing") >= 0 || find(token, "cachePriming") >= 0 {
+                    index_signals = true;
+                    if kind == "end" { indexing_done = true; }
+                }
                 if find(token, "flycheck") >= 0 || find(token, "cargo check") >= 0 {
                     if kind == "begin" { checking++; }
                     if kind == "end" { if checking > 0 { checking--; } checks_ended++; }
@@ -220,6 +226,7 @@ fn pump<F>(timeout_ms: i64) -> bool {
         }
         // rust-analyzer says when it has nothing left to load or index.
         if has_method && method == "experimental/serverStatus" {
+            index_signals = true;
             let q, q_ok = json::as_bool(json::member(json::member(root, "params"), "quiescent"));
             if q_ok && q { indexing_done = true; }
         }
@@ -256,10 +263,61 @@ fn notify(method: const u8[:], params: const u8[:]) {
     send(str("{\"jsonrpc\":\"2.0\",\"method\":\"", method, "\",\"params\":", params, "}"));
 }
 
+// A path as a file URI's path: bytes other than letters, digits, - . _ ~
+// and / are %XX, so `a#b.ts` or a space is not read as a fragment or a break.
+fn encode_path(path: const u8[:], out: u8[>..]&) {
+    let hex = "0123456789ABCDEF";
+    for c in path {
+        if (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || (c >= '0' && c <= '9') ||
+           c == '-' || c == '.' || c == '_' || c == '~' || c == '/' { out.push(c); }
+        else { out.push('%'); out.push(hex[c >> 4]); out.push(hex[c & 15]); }
+    }
+}
+
+fn hex_val(c: u8) -> i64 {
+    if c >= '0' && c <= '9' { return c - '0'; }
+    if c >= 'a' && c <= 'f' { return c - 'a' + 10; }
+    if c >= 'A' && c <= 'F' { return c - 'A' + 10; }
+    return -1;
+}
+
+// %XX back to bytes: servers encode a URI their own way, so it is compared decoded.
+fn decode_uri(u: const u8[:], out: u8[>..]&) {
+    var i = 0;
+    while i < u.len {
+        if u[i] == '%' && i + 2 < u.len && hex_val(u[i + 1]) >= 0 && hex_val(u[i + 2]) >= 0 {
+            out.push((hex_val(u[i + 1]) * 16 + hex_val(u[i + 2])) as u8);
+            i += 3;
+        } else { out.push(u[i]); i++; }
+    }
+}
+
 fn uri_of(file: const u8[:]) -> u8[>..] {
     var u: u8[>..] = [];
-    format(u, root_uri, "/", file);
+    u.append(root_uri);
+    u.push('/');
+    encode_path(file, u);
     return u;
+}
+
+// A file's key among the published sets: its URI decoded.
+fn diag_key(uri: const u8[:], key: u8[..1024]&) -> bool {
+    var d: u8[>..] = [];
+    decode_uri(uri, d);
+    guard d.len < 1024 else { return false; }
+    format(key, d);
+    return true;
+}
+
+// The path a URI names inside the repo, or false for one outside it
+// (a sibling folder that only starts with the repo's name included).
+fn repo_path_of(uri: const u8[:], out: u8[>..]&) -> bool {
+    var d: u8[>..] = [];
+    decode_uri(uri, d);
+    let prefix = str("file://", repo_dir, "/");
+    guard starts_with(d, prefix) && d.len > prefix.len else { return false; }
+    out.append(d[prefix.len..]);
+    return true;
 }
 
 // Documents the server has, by path, with their version.
@@ -313,9 +371,16 @@ fn sync_file(file: const u8[:]) -> bool {
     return true;
 }
 
+// Waits for a server that reports its indexing to finish it. One that has
+// reported nothing by the first question is not waited for: pyright and the
+// TypeScript server answer as they go.
 fn wait_indexed() {
-    if indexing_done { return; }
-    pump(180000) { m, method, id => indexing_done };
+    if indexing_done || index_silent { return; }
+    if !index_signals {
+        pump(2000) { m, method, id => index_signals || indexing_done };
+        if !index_signals { index_silent = true; return; }
+    }
+    if !indexing_done { pump(180000) { m, method, id => indexing_done }; }
 }
 
 fn sev_word(n: i64) -> const u8[:] {
@@ -325,9 +390,12 @@ fn sev_word(n: i64) -> const u8[:] {
 // Keeps a published set in our shape (1-based positions).
 fn keep_diagnostics(p: json::Node?) {
     let u, u_ok = json::as_string(json::member(p, "uri"));
-    guard u_ok && u.len < 1024;
+    guard u_ok;
     var key: u8[..1024] = [];
-    format(key, u);
+    guard diag_key(u, key);
+    compact_diagnostics();
+    let ver, v_ok = json::as_i64(json::member(p, "version"));
+    if v_ok { diag_ver.insert(key, ver); } else { diag_ver.remove(key); }
     let start = diag_text.len;
     diag_text.push('[');
     var n = 0;
@@ -368,18 +436,49 @@ fn keep_diagnostics(p: json::Node?) {
     diag_len.insert(key, diag_text.len - start);
 }
 
+// Older sets are dropped from diag_text once they are most of it, so a long
+// session keeps about what is current rather than every set ever published.
+fn compact_diagnostics() {
+    var live = 0;
+    diag_len.each() { k, n => live += n; };
+    guard diag_text.len > (1 << 20) && diag_text.len > 2 * live;
+    var keys: u8[>..] = [];
+    diag_at.each() { k, at => keys.append(k); keys.push('\n'); };
+    var kept: u8[>..] = [];
+    each_split(keys, '\n') { k =>
+        guard k.len > 0;
+        var key: u8[..1024] = [];
+        format(key, k);
+        let at = diag_at.get(key);
+        let n = diag_len.get(key);
+        var moved = -1;
+        if at && n {
+            moved = kept.len;
+            kept.append(diag_text[at..at + n]);
+        }
+        if moved >= 0 { diag_at.insert(key, moved); }
+    };
+    diag_text.clear();
+    diag_text.append(kept);
+}
+
 // The diagnostics for a file as it is on disk now. The file is synced and
 // saved, and the answer comes once the server has had its say and been quiet
 // for a moment: with after_check (rust-analyzer), when the cargo check the
 // save started has finished, since it publishes only sets that changed;
 // otherwise (pyright, typescript) when it has published for this file.
 fn diagnostics(file: const u8[:], after_check: bool, out: u8[>..]&) {
+    // What the server sent before this question (a set for an earlier open,
+    // say) is read first, so it is not taken for the answer to this one.
+    pump(20) { m, method, id => false };
     let before = checks_ended;
     let before_pub = publishes;
-    let uri = uri_of(file);
     var key: u8[..1024] = [];
-    format(key, uri);
+    guard diag_key(uri_of(file), key) else { out.append("{\"ok\":false,\"error\":\"the path is too long\"}"); return; }
     guard sync_file(file) else { out.append("{\"ok\":false,\"error\":\"cannot read the file\"}"); return; }
+    var fkey: u8[..1024] = [];
+    format(fkey, file);
+    let synced = opened.get(fkey);
     if after_check { wait_indexed(); }     // servers that publish wait for nothing else
     // A first build import (Gradle fetching itself and the dependencies) can
     // take minutes; anything else gets two.
@@ -391,9 +490,16 @@ fn diagnostics(file: const u8[:], after_check: bool, out: u8[>..]&) {
         let left = ((deadline - clock()) * 1000.0) as i64;
         if left <= 0 { break; }
         let seq = diag_seq.get(key);
-        let done = !importing && (if after_check { checks_ended > before && checking == 0 } else { seq && seq > before_pub });
+        // A set the server says is for an older version of the text is not the answer.
+        let ver = diag_ver.get(key);
+        let current = !ver || !synced || ver >= synced;
+        let done = !importing && (if after_check { checks_ended > before && checking == 0 } else { seq && seq > before_pub && current });
         // Once the check is over, 300 ms with no message means the last set is in.
         let more = pump(if done { 300 } else { min(left, 1000) }) { m, method, id => true };
+        if gone {
+            out.append("{\"ok\":false,\"gone\":true,\"error\":\"the language server stopped before it answered\"}");
+            return;
+        }
         if done && !more { settled = true; break; }
     }
     let at = diag_at.get(key);
@@ -419,7 +525,13 @@ fn implementations(file: const u8[:], line: i64, col: i64, out: u8[>..]&) {
     var answer: u8[>..] = [];
     pump(120000) { m, method, idt =>
         let mine = method.len == 0 && idt == want;
-        if mine {
+        if mine && json::member(m, "error") {
+            let msg, m_ok = json::as_string(json::member(json::member(m, "error"), "message"));
+            out.append("{\"ok\":false,\"error\":");
+            json::format_string(out, if m_ok { msg } else { "the server answered with an error" });
+            out.push('}');
+            answer.push(1);
+        } else if mine {
             out.append("{\"ok\":true,\"locations\":[");
             let res = json::member(m, "result");
             var n = 0;
@@ -431,11 +543,12 @@ fn implementations(file: const u8[:], line: i64, col: i64, out: u8[>..]&) {
                     if !u_ok { u, u_ok = json::as_string(json::member(loc, "targetUri")); r .= json::member(loc, "targetSelectionRange"); }
                     let ln, l_ok = json::as_i64(json::member(json::member(r, "start"), "line"));
                     let cn, c_ok = json::as_i64(json::member(json::member(r, "start"), "character"));
-                    if u_ok && l_ok && c_ok && starts_with(u, root_uri) {
+                    var rel: u8[>..] = [];
+                    if u_ok && l_ok && c_ok && repo_path_of(u, rel) {
                         if n > 0 { out.push(','); }
                         n++;
                         out.append("{\"file\":");
-                        json::format_string(out, u[root_uri.len + 1..]);
+                        json::format_string(out, rel);
                         format(out, ",\"line\":", ln + 1, ",\"col\":", cn + 1, "}");
                     }
                 };
@@ -445,7 +558,8 @@ fn implementations(file: const u8[:], line: i64, col: i64, out: u8[>..]&) {
         }
         mine
     };
-    if answer.len == 0 { out.append("{\"ok\":false,\"error\":\"no answer from the server\"}"); }
+    if answer.len == 0 && gone { out.append("{\"ok\":false,\"gone\":true,\"error\":\"the language server stopped before it answered\"}"); }
+    else if answer.len == 0 { out.append("{\"ok\":false,\"error\":\"no answer from the server\"}"); }
 }
 
 var answer: u8[>..];
@@ -456,12 +570,16 @@ export "golsp_lib_start" fn start(repo: const u8[:], log: const u8[:], init_json
     // A fresh session, also after a server died.
     repo_dir.clear(); root_uri.clear(); log_path.clear(); init_options.clear(); inbox.clear(); opened.clear();
     language_id.clear(); language_id.append(lang_id);
-    gone = false; indexing_done = false; checking = 0; checks_ended = 0; importing = false; import_failed.clear();
-    diag_text.clear(); diag_at.clear(); diag_len.clear(); diag_seq.clear(); publishes = 0;
+    gone = false; indexing_done = false; index_signals = false; index_silent = false; checking = 0; checks_ended = 0; importing = false; import_failed.clear();
+    diag_text.clear(); diag_at.clear(); diag_len.clear(); diag_seq.clear(); diag_ver.clear(); publishes = 0;
     var tv: u8[>..] = [];
     trace = env("GOLSP_TRACE", tv) && tv == "1";
     format(repo_dir, repo);
-    format(root_uri, "file://", repo);
+    root_uri.append("file://");
+    var enc: u8[>..] = [];
+    encode_path(repo, enc);
+    guard enc.len + 7 < 4096 else { return false; }
+    root_uri.append(enc);
     format(log_path, log);
     init_options.append(init_json);
     server = proc_open(argv, repo, env_vars, log);
@@ -478,8 +596,22 @@ export "golsp_lib_start" fn start(repo: const u8[:], log: const u8[:], init_json
     init.append(",\"name\":\"repo\"}]}");
     let iid = request("initialize", init);
     let want = str(iid);
-    let started = pump(120000) { m, method, idt => method.len == 0 && idt == want };
-    if !started { note("no answer to initialize"); return false; }
+    var init_error: u8[>..] = [];
+    let started = pump(120000) { m, method, idt =>
+        let mine = method.len == 0 && idt == want;
+        if mine && json::member(m, "error") {
+            let msg, m_ok = json::as_string(json::member(json::member(m, "error"), "message"));
+            init_error.append(if m_ok { msg } else { "an error" });
+        }
+        mine
+    };
+    if !started || init_error.len > 0 {
+        let why: u8[>..] = if started { str("initialize failed: ", init_error) } else { str("no answer to initialize") };
+        note(why);
+        proc_close(server, 0);
+        server = 0;
+        return false;
+    }
     notify("initialized", "{}");
     note("initialized");
     return true;
