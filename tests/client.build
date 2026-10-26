@@ -1,0 +1,2 @@
+// Same public C/glue boundary a Goose consumer uses, with no Swan sources.
+c_sources = ["../native/proc.c", "../native/glue.c", "../build/tests/golsp.c"];
