@@ -1,5 +1,17 @@
 # goose-lsp
 
+**In plain words:** lets a Goose program talk to the "language servers" that
+power code editors (rust-analyzer for Rust, pyright for Python, the
+TypeScript server, JetBrains' Kotlin server), so it can ask "what errors does
+this file have right now?" a fraction of a second after an edit, without a
+full rebuild. The servers themselves are separate programs; this is the
+client that drives them.
+
+**Status (2026-10-26):** 11 standalone checks pass against a fake language
+server (`scripts/test.sh`). In Swan it answers live errors 0.4 to 0.9 s after
+an edit with the real servers, and can start a server early so the first
+answer comes in about 0.7 s.
+
 A language-server client for [Goose](https://aardappel.github.io/goose/)
 programs: it keeps one language server running over stdio (rust-analyzer,
 pyright, typescript-language-server, JetBrains' Kotlin server, or another
