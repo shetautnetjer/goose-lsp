@@ -16,10 +16,49 @@
 #include <sys/wait.h>
 #include <time.h>
 #include <unistd.h>
+#include <pthread.h>
 
 typedef struct { const uint8_t *data; int64_t len; } proc_slice;
 
-typedef struct { pid_t pid; int in_fd; int out_fd; } proc_t;
+/* What the program writes is read as it comes by a thread of our own into
+   a buffer that grows, so a talkative server (progress notifications while
+   it indexes) never blocks on a full pipe while nobody is asking it
+   anything. proc_read takes from that buffer. */
+typedef struct {
+    pid_t pid; int in_fd; int out_fd;
+    pthread_t reader; pthread_mutex_t mu; pthread_cond_t cv;
+    uint8_t *buf; int64_t len, cap; bool closed, stop;
+} proc_t;
+
+static void *reader_main(void *arg) {
+    proc_t *p = arg;
+    uint8_t chunk[65536];
+    for (;;) {
+        /* Polls, so that closing can stop it even when a process outside the
+           group (a build daemon the server started) still holds the pipe. */
+        struct pollfd fd = {p->out_fd, POLLIN, 0};
+        int r = poll(&fd, 1, 200);
+        pthread_mutex_lock(&p->mu);
+        bool stop = p->stop;
+        pthread_mutex_unlock(&p->mu);
+        if (stop) return NULL;
+        if (r == 0 || (r < 0 && errno == EINTR)) continue;
+        ssize_t n = read(p->out_fd, chunk, sizeof chunk);
+        if (n < 0 && errno == EINTR) continue;
+        pthread_mutex_lock(&p->mu);
+        if (n <= 0) { p->closed = true; pthread_cond_broadcast(&p->cv); pthread_mutex_unlock(&p->mu); return NULL; }
+        if (p->len + n > p->cap) {
+            int64_t cap = p->cap ? p->cap : 65536;
+            while (cap < p->len + n) cap *= 2;
+            p->buf = realloc(p->buf, (size_t)cap);
+            p->cap = cap;
+        }
+        memcpy(p->buf + p->len, chunk, (size_t)n);
+        p->len += n;
+        pthread_cond_broadcast(&p->cv);
+        pthread_mutex_unlock(&p->mu);
+    }
+}
 
 extern char **environ;
 
@@ -82,6 +121,9 @@ int64_t proc_open(proc_slice argv_nul, proc_slice cwd, proc_slice env_nul, proc_
     if (pid < 0) return 0;
     proc_t *p = calloc(1, sizeof *p);
     p->pid = pid; p->in_fd = to_child[1]; p->out_fd = from_child[0];
+    pthread_mutex_init(&p->mu, NULL);
+    pthread_cond_init(&p->cv, NULL);
+    pthread_create(&p->reader, NULL, reader_main, p);
     return (int64_t)(intptr_t)p;
 }
 
@@ -97,17 +139,30 @@ bool proc_write(int64_t h, proc_slice data) {
     return true;
 }
 
-/* Reads what the program has written into buf, waiting up to timeout_ms for
-   the first byte. Returns the bytes read, 0 on timeout, -1 once it has
-   closed. */
+/* Moves what the program has written into buf, waiting up to timeout_ms
+   for the first byte. Returns the bytes moved, 0 on timeout, -1 once it has
+   closed and everything has been read. */
 int64_t proc_read(int64_t h, int64_t timeout_ms, proc_slice buf) {
     proc_t *p = (proc_t *)(intptr_t)h;
-    struct pollfd fd = {p->out_fd, POLLIN, 0};
-    int r;
-    do { r = poll(&fd, 1, (int)timeout_ms); } while (r < 0 && errno == EINTR);
-    if (r <= 0) return 0;
-    ssize_t n = read(p->out_fd, (uint8_t *)buf.data, (size_t)buf.len);
-    return n <= 0 ? -1 : n;
+    pthread_mutex_lock(&p->mu);
+    if (p->len == 0 && !p->closed && timeout_ms > 0) {
+        struct timespec until;
+        clock_gettime(CLOCK_REALTIME, &until);
+        until.tv_sec += timeout_ms / 1000;
+        until.tv_nsec += (timeout_ms % 1000) * 1000000;
+        if (until.tv_nsec >= 1000000000) { until.tv_sec++; until.tv_nsec -= 1000000000; }
+        while (p->len == 0 && !p->closed)
+            if (pthread_cond_timedwait(&p->cv, &p->mu, &until) != 0) break;
+    }
+    int64_t n = p->len < buf.len ? p->len : buf.len;
+    if (n > 0) {
+        memcpy((uint8_t *)buf.data, p->buf, (size_t)n);
+        memmove(p->buf, p->buf + n, (size_t)(p->len - n));
+        p->len -= n;
+    }
+    bool done = n == 0 && p->closed;
+    pthread_mutex_unlock(&p->mu);
+    return done ? -1 : n;
 }
 
 /* Closes stdin, gives it grace_ms to exit, then kills it and anything left
@@ -117,13 +172,21 @@ void proc_close(int64_t h, int64_t grace_ms) {
     close(p->in_fd);
     int status;
     for (int64_t waited = 0; waited < grace_ms; waited += 20) {
-        if (waitpid(p->pid, &status, WNOHANG) == p->pid) { kill(-p->pid, SIGKILL); close(p->out_fd); free(p); return; }
+        if (waitpid(p->pid, &status, WNOHANG) == p->pid) { kill(-p->pid, SIGKILL); goto done; }
         struct timespec ts = {0, 20 * 1000000};
         nanosleep(&ts, NULL);
     }
     kill(-p->pid, SIGKILL);
     kill(p->pid, SIGKILL);
     waitpid(p->pid, &status, 0);
+done:
+    pthread_mutex_lock(&p->mu);
+    p->stop = true;
+    pthread_mutex_unlock(&p->mu);
+    pthread_join(p->reader, NULL);
     close(p->out_fd);
+    free(p->buf);
+    pthread_mutex_destroy(&p->mu);
+    pthread_cond_destroy(&p->cv);
     free(p);
 }

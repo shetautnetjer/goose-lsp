@@ -41,6 +41,8 @@ section. Questions:
       "severity":"error","source":"rustc","code":"E0061","message":"..."}]}
 {"op":"implementations","file":"src/lib.rs","line":12,"col":11}
   -> {"ok":true,"locations":[{"file":"src/lib.rs","line":23,"col":1}]}
+{"op":"open","file":"src/lib.rs"}
+  -> {"ok":true}    // at once; the server starts loading the project
 ```
 
 Positions are 1-based. Each question re-reads its file from disk and syncs it
@@ -49,7 +51,9 @@ save starts (rust-analyzer's cargo check); `"publish"` waits for the file's
 next published set (pyright, the TypeScript and Kotlin servers). A Kotlin
 build import (Gradle) is waited for. A server that dies is reported as
 `"gone":true`, never fatal. Servers run in their own process group and are
-killed whole on stop. `GOLSP_TRACE=1` logs every message from the server.
+killed whole on stop. A thread of the shim reads the server's output as it
+comes, so a server busy indexing never blocks on a full pipe while the host
+asks nothing. `GOLSP_TRACE=1` logs every message from the server.
 
 Linux (and other POSIX) only, for now: native/proc.c uses fork, pipes and
 process groups. One server per process.

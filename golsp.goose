@@ -11,6 +11,7 @@
 //   {"op":"diagnostics","file":"src/lib.rs","settle":"check"|"publish"}
 //     -> {"ok":true,"diagnostics":[{"line":..,"col":..,"end_line":..,"end_col":..,
 //         "severity":"error","source":"rustc","code":"E0061","message":".."}]}
+//   {"op":"open","file":"src/lib.rs"} -> {"ok":true}, at once: the server starts on it
 //   {"op":"implementations","file":"src/lib.rs","line":12,"col":11}
 //     -> {"ok":true,"locations":[{"file":"src/lib.rs","line":23,"col":1}]}
 // Each question re-reads its file from disk and tells the server, so edits
@@ -506,6 +507,13 @@ export "golsp_lib_ask" fn ask(question: const u8[:]) -> const u8[:] {
     var file: u8[>..] = [];
     file.append(file_in);
     let settle, s_ok = json::as_string(json::member(q, "settle"));
+    // Opens a file and returns at once, so the server starts loading the
+    // project it belongs to (the TypeScript server does that on the first
+    // open) while the host does other things.
+    if o_ok && op == "open" && f_ok {
+        if sync_file(file) { answer.append("{\"ok\":true}"); } else { answer.append("{\"ok\":false,\"error\":\"cannot read the file\"}"); }
+        return answer;
+    }
     if o_ok && op == "diagnostics" && f_ok { diagnostics(file, s_ok && settle == "check", answer); }
     else if o_ok && op == "implementations" && f_ok {
         let ln, l_ok = json::as_i64(json::member(q, "line"));
