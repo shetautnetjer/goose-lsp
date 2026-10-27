@@ -20,6 +20,11 @@
 
 typedef struct { const uint8_t *data; int64_t len; } proc_slice;
 
+/* Unread output kept for the host at most, and how long a write may wait
+   for a server that has stopped reading its input. */
+#define PROC_MAX_PENDING ((int64_t)256 << 20)
+#define PROC_WRITE_WAIT_MS 60000
+
 /* What the program writes is read as it comes by a thread of our own into
    a buffer that grows, so a talkative server (progress notifications while
    it indexes) never blocks on a full pipe while nobody is asking it
@@ -48,9 +53,14 @@ static void *reader_main(void *arg) {
         pthread_mutex_lock(&p->mu);
         if (n <= 0) { p->closed = true; pthread_cond_broadcast(&p->cv); pthread_mutex_unlock(&p->mu); return NULL; }
         if (p->len + n > p->cap) {
+            /* A server that writes this much with nobody reading is not
+               going to be caught up with: the session ends as if it had
+               closed, rather than the host running out of memory. */
             int64_t cap = p->cap ? p->cap : 65536;
             while (cap < p->len + n) cap *= 2;
-            p->buf = realloc(p->buf, (size_t)cap);
+            uint8_t *grown = cap <= PROC_MAX_PENDING ? realloc(p->buf, (size_t)cap) : NULL;
+            if (!grown) { p->closed = true; pthread_cond_broadcast(&p->cv); pthread_mutex_unlock(&p->mu); return NULL; }
+            p->buf = grown;
             p->cap = cap;
         }
         memcpy(p->buf + p->len, chunk, (size_t)n);
@@ -62,7 +72,8 @@ static void *reader_main(void *arg) {
 
 extern char **environ;
 
-static char **nul_list(const char *buf, int64_t len, char **append) {
+/* The NUL-separated strings in buf (copied; *own of them), then append's. */
+static char **nul_list(const char *buf, int64_t len, char **append, int64_t *own) {
     int64_t n = 0, extra = 0;
     for (int64_t i = 0; i < len; i++) if (buf[i] == 0) n++;
     while (append && append[extra]) extra++;
@@ -70,9 +81,15 @@ static char **nul_list(const char *buf, int64_t len, char **append) {
     int64_t k = 0;
     for (int64_t i = 0, start = 0; i < len; i++)
         if (buf[i] == 0) { v[k++] = strdup(buf + start); start = i + 1; }
+    *own = k;
     for (int64_t i = 0; i < extra; i++) v[k++] = append[i];
     v[k] = NULL;
     return v;
+}
+
+static void free_list(char **v, int64_t own) {
+    for (int64_t i = 0; i < own; i++) free(v[i]);
+    free(v);
 }
 
 /* Starts argv (NUL-separated; argv[0] a path or found on PATH) in cwd with env
@@ -83,10 +100,15 @@ int64_t proc_open(proc_slice argv_nul, proc_slice cwd, proc_slice env_nul, proc_
     if (cwd.len >= (int64_t)sizeof cwdbuf || log_path.len >= (int64_t)sizeof logbuf) return 0;
     memcpy(cwdbuf, cwd.data, (size_t)cwd.len); cwdbuf[cwd.len] = 0;
     memcpy(logbuf, log_path.data, (size_t)log_path.len); logbuf[log_path.len] = 0;
-    char **argv = nul_list((const char *)argv_nul.data, argv_nul.len, NULL);
-    char **envp = nul_list((const char *)env_nul.data, env_nul.len, environ);
-    int to_child[2], from_child[2];
-    if (!argv[0] || pipe(to_child) != 0 || pipe(from_child) != 0) return 0;
+    int64_t argv_own, envp_own;
+    char **argv = nul_list((const char *)argv_nul.data, argv_nul.len, NULL, &argv_own);
+    char **envp = nul_list((const char *)env_nul.data, env_nul.len, environ, &envp_own);
+    int to_child[2] = {-1, -1}, from_child[2] = {-1, -1};
+    if (!argv[0] || pipe(to_child) != 0 || pipe(from_child) != 0) {
+        for (int i = 0; i < 2; i++) { if (to_child[i] >= 0) close(to_child[i]); if (from_child[i] >= 0) close(from_child[i]); }
+        free_list(argv, argv_own); free_list(envp, envp_own);
+        return 0;
+    }
     const char *path_env = NULL;
     for (char **e = envp; *e; e++) if (strncmp(*e, "PATH=", 5) == 0) { path_env = *e + 5; break; }
     pid_t pid = fork();
@@ -117,8 +139,11 @@ int64_t proc_open(proc_slice argv_nul, proc_slice cwd, proc_slice env_nul, proc_
         _exit(127);
     }
     close(to_child[0]); close(from_child[1]);
+    free_list(argv, argv_own); free_list(envp, envp_own);
     signal(SIGPIPE, SIG_IGN);
-    if (pid < 0) return 0;
+    if (pid < 0) { close(to_child[1]); close(from_child[0]); return 0; }
+    /* Writes wait with a deadline (proc_write), not forever. */
+    fcntl(to_child[1], F_SETFL, fcntl(to_child[1], F_GETFL) | O_NONBLOCK);
     proc_t *p = calloc(1, sizeof *p);
     p->pid = pid; p->in_fd = to_child[1]; p->out_fd = from_child[0];
     pthread_mutex_init(&p->mu, NULL);
@@ -127,14 +152,31 @@ int64_t proc_open(proc_slice argv_nul, proc_slice cwd, proc_slice env_nul, proc_
     return (int64_t)(intptr_t)p;
 }
 
-/* Writes all of data to the program's stdin. False if it has gone. */
+static int64_t now_ms(void) {
+    struct timespec t;
+    clock_gettime(CLOCK_MONOTONIC, &t);
+    return (int64_t)t.tv_sec * 1000 + t.tv_nsec / 1000000;
+}
+
+/* Writes all of data to the program's stdin. False if it has gone, or has
+   not taken all of it within PROC_WRITE_WAIT_MS (a hung server must not hang the host). */
 bool proc_write(int64_t h, proc_slice data) {
     proc_t *p = (proc_t *)(intptr_t)h;
+    /* One deadline for the whole message: a server that takes it a little
+       at a time, or signals that interrupt the wait, do not extend it. */
+    int64_t deadline = now_ms() + PROC_WRITE_WAIT_MS;
     int64_t off = 0;
     while (off < data.len) {
         ssize_t n = write(p->in_fd, data.data + off, (size_t)(data.len - off));
-        if (n < 0) { if (errno == EINTR) continue; return false; }
-        off += n;
+        if (n >= 0) { off += n; continue; }
+        if (errno == EINTR) continue;
+        if (errno != EAGAIN && errno != EWOULDBLOCK) return false;
+        int64_t left = deadline - now_ms();
+        if (left <= 0) return false;
+        struct pollfd fd = {p->in_fd, POLLOUT, 0};
+        int r = poll(&fd, 1, (int)left);
+        if (r < 0 && errno == EINTR) continue;
+        if (r <= 0 || (fd.revents & (POLLERR | POLLHUP))) return false;
     }
     return true;
 }
