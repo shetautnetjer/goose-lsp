@@ -1,0 +1,36 @@
+{
+  "autoReview": ["open"],
+  "effort": "base",
+  "strictness": 2,
+  "commentTypes": ["logic", "syntax"],
+  "fixWithAI": true,
+  "context": {
+    "repos": ["shetautnetjer/Swan"]
+  },
+  "rules": [
+    {
+      "id": "server-agnostic-waits",
+      "rule": "Waits and readiness checks must work for every supported language server, not only rust-analyzer, and must stop at once when the server process dies.",
+      "scope": ["golsp.goose"],
+      "severity": "high"
+    },
+    {
+      "id": "jsonrpc-errors-fail",
+      "rule": "A JSON-RPC response that carries an error member is a failure; never report it as success.",
+      "scope": ["golsp.goose"],
+      "severity": "high"
+    },
+    {
+      "id": "uri-handling",
+      "rule": "Build file URIs with percent-encoding, and match workspace roots on whole path segments so a sibling like /work/app-extra never matches /work/app.",
+      "scope": ["golsp.goose"],
+      "severity": "medium"
+    },
+    {
+      "id": "bounded-native-io",
+      "rule": "Native process I/O must have deadlines and bounded buffers, check realloc results, and free everything on failure paths.",
+      "scope": ["native/**"],
+      "severity": "medium"
+    }
+  ]
+}
