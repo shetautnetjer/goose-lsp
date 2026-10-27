@@ -375,7 +375,11 @@ fn sync_file(file: const u8[:]) -> bool {
 // reported nothing by the first question is not waited for: pyright and the
 // TypeScript server answer as they go.
 fn wait_indexed() {
-    if indexing_done || index_silent { return; }
+    if indexing_done { return; }
+    // What the server has sent already is read first: a signal that comes
+    // after the first guess of silence still counts.
+    pump(20) { m, method, id => false };
+    if indexing_done || (index_silent && !index_signals) { return; }
     if !index_signals {
         pump(2000) { m, method, id => index_signals || indexing_done };
         if !index_signals { index_silent = true; return; }
@@ -442,22 +446,19 @@ fn compact_diagnostics() {
     var live = 0;
     diag_len.each() { k, n => live += n; };
     guard diag_text.len > (1 << 20) && diag_text.len > 2 * live;
-    var keys: u8[>..] = [];
-    diag_at.each() { k, at => keys.append(k); keys.push('\n'); };
+    // New offsets go into a map of their own, key by key as stored (a
+    // decoded path may hold any byte but NUL), and replace the old map whole.
     var kept: u8[>..] = [];
-    each_split(keys, '\n') { k =>
-        guard k.len > 0;
-        var key: u8[..1024] = [];
-        format(key, k);
-        let at = diag_at.get(key);
-        let n = diag_len.get(key);
-        var moved = -1;
-        if at && n {
-            moved = kept.len;
+    var moved = dictionary<u8[..1024], i64> {};
+    diag_at.each() { k, at =>
+        let n = diag_len.get(k);
+        if n {
+            moved.insert(k, kept.len);
             kept.append(diag_text[at..at + n]);
         }
-        if moved >= 0 { diag_at.insert(key, moved); }
     };
+    diag_at.clear();
+    moved.each() { k, at => diag_at.insert(k, at); };
     diag_text.clear();
     diag_text.append(kept);
 }
@@ -493,7 +494,7 @@ fn diagnostics(file: const u8[:], after_check: bool, out: u8[>..]&) {
         // A set the server says is for an older version of the text is not the answer.
         let ver = diag_ver.get(key);
         let current = !ver || !synced || ver >= synced;
-        let done = !importing && (if after_check { checks_ended > before && checking == 0 } else { seq && seq > before_pub && current });
+        let done = !importing && current && (if after_check { checks_ended > before && checking == 0 } else { seq && seq > before_pub });
         // Once the check is over, 300 ms with no message means the last set is in.
         let more = pump(if done { 300 } else { min(left, 1000) }) { m, method, id => true };
         if gone {
@@ -501,6 +502,12 @@ fn diagnostics(file: const u8[:], after_check: bool, out: u8[>..]&) {
             return;
         }
         if done && !more { settled = true; break; }
+    }
+    // A set the server says is for older text is not returned as this text's.
+    let ver = diag_ver.get(key);
+    if ver && synced && ver < synced {
+        out.append("{\"ok\":false,\"settled\":false,\"error\":\"the server has not published diagnostics for the current text yet\"}");
+        return;
     }
     let at = diag_at.get(key);
     out.append("{\"ok\":true,");
@@ -597,15 +604,17 @@ export "golsp_lib_start" fn start(repo: const u8[:], log: const u8[:], init_json
     let iid = request("initialize", init);
     let want = str(iid);
     var init_error: u8[>..] = [];
+    var init_failed = false;
     let started = pump(120000) { m, method, idt =>
         let mine = method.len == 0 && idt == want;
         if mine && json::member(m, "error") {
+            init_failed = true;
             let msg, m_ok = json::as_string(json::member(json::member(m, "error"), "message"));
-            init_error.append(if m_ok { msg } else { "an error" });
+            init_error.append(if m_ok && msg.len > 0 { msg } else { "an error with no message" });
         }
         mine
     };
-    if !started || init_error.len > 0 {
+    if !started || init_failed {
         let why: u8[>..] = if started { str("initialize failed: ", init_error) } else { str("no answer to initialize") };
         note(why);
         proc_close(server, 0);

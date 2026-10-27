@@ -152,19 +152,30 @@ int64_t proc_open(proc_slice argv_nul, proc_slice cwd, proc_slice env_nul, proc_
     return (int64_t)(intptr_t)p;
 }
 
+static int64_t now_ms(void) {
+    struct timespec t;
+    clock_gettime(CLOCK_MONOTONIC, &t);
+    return (int64_t)t.tv_sec * 1000 + t.tv_nsec / 1000000;
+}
+
 /* Writes all of data to the program's stdin. False if it has gone, or has
-   taken nothing for PROC_WRITE_WAIT_MS (a hung server must not hang the host). */
+   not taken all of it within PROC_WRITE_WAIT_MS (a hung server must not hang the host). */
 bool proc_write(int64_t h, proc_slice data) {
     proc_t *p = (proc_t *)(intptr_t)h;
+    /* One deadline for the whole message: a server that takes it a little
+       at a time, or signals that interrupt the wait, do not extend it. */
+    int64_t deadline = now_ms() + PROC_WRITE_WAIT_MS;
     int64_t off = 0;
     while (off < data.len) {
         ssize_t n = write(p->in_fd, data.data + off, (size_t)(data.len - off));
         if (n >= 0) { off += n; continue; }
         if (errno == EINTR) continue;
         if (errno != EAGAIN && errno != EWOULDBLOCK) return false;
+        int64_t left = deadline - now_ms();
+        if (left <= 0) return false;
         struct pollfd fd = {p->in_fd, POLLOUT, 0};
-        int r;
-        do r = poll(&fd, 1, PROC_WRITE_WAIT_MS); while (r < 0 && errno == EINTR);
+        int r = poll(&fd, 1, (int)left);
+        if (r < 0 && errno == EINTR) continue;
         if (r <= 0 || (fd.revents & (POLLERR | POLLHUP))) return false;
     }
     return true;

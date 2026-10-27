@@ -39,6 +39,7 @@ fn main() {
     assert(write_file(str(repo, "/sample.ts"), "fixed\n"));
     ask("changed", "{\"op\":\"diagnostics\",\"file\":\"sample.ts\",\"settle\":\"check\"}");
     ask("implementations", "{\"op\":\"implementations\",\"file\":\"sample.ts\",\"line\":3,\"col\":5}");
+    ask("special-name", "{\"op\":\"diagnostics\",\"file\":\"a#b c%.ts\",\"settle\":\"publish\"}");
     golsp_stop();
     ask("stopped", "{\"op\":\"diagnostics\",\"file\":\"sample.ts\"}");
 
@@ -54,6 +55,21 @@ fn main() {
     assert(golsp_start(repo, str(repo, "/quiet.log"), "{}", quiet, "", "typescript"));
     ask("quiet-error", "{\"op\":\"implementations\",\"file\":\"sample.ts\",\"line\":1,\"col\":1}");
     ask("quiet-dies", "{\"op\":\"diagnostics\",\"file\":\"sample.ts\",\"settle\":\"publish\"}");
+    golsp_stop();
+
+    // A server that rejects initialization, even with an empty message, is not started.
+    let failing = server_args(a[2], a[3], "initfail", repo);
+    assert(!golsp_start(repo, str(repo, "/initfail.log"), "{}", failing, "", "typescript"));
+    ask("init-rejected", "{\"op\":\"diagnostics\",\"file\":\"sample.ts\"}");
+    golsp_stop();
+
+    // Indexing reported only after the first question still holds later
+    // lookups; a set published for older text is not the answer.
+    let late = server_args(a[2], a[3], "late", repo);
+    assert(golsp_start(repo, str(repo, "/late.log"), "{}", late, "", "typescript"));
+    ask("late-first", "{\"op\":\"implementations\",\"file\":\"sample.ts\",\"line\":1,\"col\":1}");
+    ask("late-second", "{\"op\":\"implementations\",\"file\":\"sample.ts\",\"line\":1,\"col\":1}");
+    ask("late-diagnostics", "{\"op\":\"diagnostics\",\"file\":\"sample.ts\",\"settle\":\"publish\"}");
     golsp_stop();
 
     var absent: u8[>..] = [];
