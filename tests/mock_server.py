@@ -112,6 +112,14 @@ while (message := read_message()) is not None:
     elif method == "textDocument/didSave" and mode == "silent":
         # Like lua-language-server on a clean file: publishes nothing at all.
         pass
+    elif method == "textDocument/didSave" and mode == "trickle":
+        # Talks partway through the quiet spell, then publishes a set: the
+        # answer must wait for it rather than end the silence early.
+        uri = params["textDocument"]["uri"]
+        threading.Timer(0.45, notify, ["window/logMessage", {"type": 3, "message": "still working"}]).start()
+        threading.Timer(0.85, notify, ["textDocument/publishDiagnostics", {"uri": uri, "diagnostics": [
+            {"range": {"start": {"line": 0, "character": 0}, "end": {"line": 0, "character": 1}},
+             "severity": 1, "message": "late"}]}]).start()
     elif method == "textDocument/didSave":
         uri = params["textDocument"]["uri"]
         notify("$/progress", {"token": "flycheck-fixture", "value": {"kind": "begin"}})

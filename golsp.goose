@@ -503,7 +503,13 @@ fn diagnostics(file: const u8[:], after_check: bool, quiet_ms: i64, out: u8[>..]
         let current = !ver || !synced || ver >= synced;
         let done = !importing && current && (if after_check { checks_ended > before && checking == 0 } else { seq && seq > before_pub });
         // Once the check is over, 300 ms with no message means the last set is in.
-        let more = pump(if done { 300 } else { min(left, 1000) }) { m, method, id => true };
+        // With a quiet spell, wake when it would end rather than a second later.
+        var wait = min(left, 1000);
+        if !done && !after_check && quiet_ms > 0 {
+            let until = ((max(last_heard, asked) + quiet_ms / 1000.0 - clock()) * 1000.0) as i64 + 10;
+            wait = max(10, min(wait, until));
+        }
+        let more = pump(if done { 300 } else { wait }) { m, method, id => true };
         if gone {
             out.append("{\"ok\":false,\"gone\":true,\"error\":\"the language server stopped before it answered\"}");
             return;
