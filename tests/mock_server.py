@@ -109,6 +109,9 @@ while (message := read_message()) is not None:
              "severity": 1, "message": "stale"}]})
         threading.Timer(0.6, notify, ["textDocument/publishDiagnostics",
                                       {"uri": uri, "version": version, "diagnostics": []}]).start()
+    elif method == "textDocument/didSave" and mode == "silent":
+        # Like lua-language-server on a clean file: publishes nothing at all.
+        pass
     elif method == "textDocument/didSave":
         uri = params["textDocument"]["uri"]
         notify("$/progress", {"token": "flycheck-fixture", "value": {"kind": "begin"}})
