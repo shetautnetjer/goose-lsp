@@ -505,7 +505,9 @@ fn diagnostics(file: const u8[:], after_check: bool, quiet_ms: i64, out: u8[>..]
         // Once the check is over, 300 ms with no message means the last set is in.
         // With a quiet spell, wake when it would end rather than a second later.
         var wait = min(left, 1000);
-        if !done && !after_check && quiet_ms > 0 {
+        // Only while the quiet rule could answer: not during an import, nor
+        // while the newest set is for older text.
+        if !done && !after_check && quiet_ms > 0 && !importing && current {
             let until = ((max(last_heard, asked) + quiet_ms / 1000.0 - clock()) * 1000.0) as i64 + 10;
             wait = max(10, min(wait, until));
         }
