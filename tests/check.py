@@ -57,7 +57,7 @@ try:
         answers[name] = json.loads(body)
     expected = {"malformed", "unknown", "missing-file", "missing-position", "first", "changed",
                 "implementations", "stopped", "death-request", "dead", "failed-start", "quiet-error", "quiet-dies",
-                "special-name", "init-rejected", "late-first", "late-second", "late-diagnostics"}
+                "special-name", "init-rejected", "late-first", "late-second", "late-diagnostics", "silent-clean", "trickle-late"}
     require(set(answers) == expected, f"missing or extra answers: {set(answers) ^ expected}")
     for name in ("malformed", "unknown", "missing-file", "missing-position"):
         require(answers[name].get("ok") is False and answers[name].get("error"), f"{name} must fail")
@@ -80,6 +80,10 @@ try:
             f"a lookup after indexing began must wait for it to end: {answers['late-second']}")
     require(answers["late-diagnostics"] == {"ok": True, "diagnostics": []},
             f"a set for older text must not be the answer: {answers['late-diagnostics']}")
+    require(answers["silent-clean"] == {"ok": True, "diagnostics": []},
+            f"a server silent on a clean file answers after quiet_ms: {answers['silent-clean']}")
+    require(answers["trickle-late"].get("ok") is True and len(answers["trickle-late"].get("diagnostics", [])) == 1,
+            f"a message during the silence restarts it, so the later set is the answer: {answers['trickle-late']}")
     require(answers["death-request"].get("ok") is False, "request interrupted by EOF must fail")
     for name in ("stopped", "dead", "failed-start"):
         require(answers[name].get("ok") is False and answers[name].get("gone") is True, f"{name} must report gone")

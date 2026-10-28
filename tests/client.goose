@@ -57,6 +57,20 @@ fn main() {
     ask("quiet-dies", "{\"op\":\"diagnostics\",\"file\":\"sample.ts\",\"settle\":\"publish\"}");
     golsp_stop();
 
+    // A server that publishes nothing for a clean file answers after quiet_ms
+    // of silence, not after the two-minute deadline.
+    let silent = server_args(a[2], a[3], "silent", repo);
+    assert(golsp_start(repo, str(repo, "/silent.log"), "{}", silent, "", "lua"));
+    ask("silent-clean", "{\"op\":\"diagnostics\",\"file\":\"sample.ts\",\"settle\":\"publish\",\"quiet_ms\":500}");
+    golsp_stop();
+
+    // A server that speaks partway through the silence restarts it; its set,
+    // published after the first 500 ms, is the answer.
+    let trickle = server_args(a[2], a[3], "trickle", repo);
+    assert(golsp_start(repo, str(repo, "/trickle.log"), "{}", trickle, "", "lua"));
+    ask("trickle-late", "{\"op\":\"diagnostics\",\"file\":\"sample.ts\",\"settle\":\"publish\",\"quiet_ms\":500}");
+    golsp_stop();
+
     // A server that rejects initialization, even with an empty message, is not started.
     let failing = server_args(a[2], a[3], "initfail", repo);
     assert(!golsp_start(repo, str(repo, "/initfail.log"), "{}", failing, "", "typescript"));

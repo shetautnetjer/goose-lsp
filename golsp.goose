@@ -8,7 +8,7 @@
 // Swan (github.com/shetautnetjer/Swan) is its first user.
 //
 // Questions and answers are JSON. Positions are 1-based:
-//   {"op":"diagnostics","file":"src/lib.rs","settle":"check"|"publish"}
+//   {"op":"diagnostics","file":"src/lib.rs","settle":"check"|"publish","quiet_ms":3000?}
 //     -> {"ok":true,"diagnostics":[{"line":..,"col":..,"end_line":..,"end_col":..,
 //         "severity":"error","source":"rustc","code":"E0061","message":".."}]}
 //   {"op":"open","file":"src/lib.rs"} -> {"ok":true}, at once: the server starts on it
@@ -46,6 +46,7 @@ var index_silent = false;       // it said nothing of indexing when first asked,
 var checking = 0;               // flycheck runs begun and not yet ended
 var language_id: u8[>..];       // what didOpen says the files are: rust, python, typescript
 var checks_ended = 0;
+var last_heard = 0.0;           // when the server last sent anything (clock())
 var importing = false;          // the Kotlin server is importing the build (Gradle) and has not finished
 var import_failed: u8[>..];     // why the last import failed, if it did           // flycheck runs finished, ever: a question waits for the next one
 var gone = false;               // the server has died; this runs inside the host, so never exit
@@ -197,6 +198,7 @@ fn pump<F>(timeout_ms: i64) -> bool {
         if left <= 0 { return false; }
         var msg: u8[>..] = [];
         if !take_message(left, msg) { return false; }
+        last_heard = clock();
         var doc: json::Node[>..] = [];
         var decoded: u8[>..] = [];
         let root, perr = json::parse(msg, doc, decoded);
@@ -468,7 +470,11 @@ fn compact_diagnostics() {
 // for a moment: with after_check (rust-analyzer), when the cargo check the
 // save started has finished, since it publishes only sets that changed;
 // otherwise (pyright, typescript) when it has published for this file.
-fn diagnostics(file: const u8[:], after_check: bool, out: u8[>..]&) {
+// quiet_ms, for a server that publishes nothing for a file without
+// problems (lua-language-server on a clean file): once it has said nothing
+// for that long after the question, its last set (none: no problems) is the
+// answer. 0 waits for a publish, as most servers send one.
+fn diagnostics(file: const u8[:], after_check: bool, quiet_ms: i64, out: u8[>..]&) {
     // What the server sent before this question (a set for an earlier open,
     // say) is read first, so it is not taken for the answer to this one.
     pump(20) { m, method, id => false };
@@ -481,6 +487,7 @@ fn diagnostics(file: const u8[:], after_check: bool, out: u8[>..]&) {
     format(fkey, file);
     let synced = opened.get(fkey);
     if after_check { wait_indexed(); }     // servers that publish wait for nothing else
+    let asked = clock();
     // A first build import (Gradle fetching itself and the dependencies) can
     // take minutes; anything else gets two.
     var deadline = clock() + 120.0;
@@ -496,12 +503,23 @@ fn diagnostics(file: const u8[:], after_check: bool, out: u8[>..]&) {
         let current = !ver || !synced || ver >= synced;
         let done = !importing && current && (if after_check { checks_ended > before && checking == 0 } else { seq && seq > before_pub });
         // Once the check is over, 300 ms with no message means the last set is in.
-        let more = pump(if done { 300 } else { min(left, 1000) }) { m, method, id => true };
+        // With a quiet spell, wake when it would end rather than a second later.
+        var wait = min(left, 1000);
+        // Only while the quiet rule could answer: not during an import, nor
+        // while the newest set is for older text.
+        if !done && !after_check && quiet_ms > 0 && !importing && current {
+            let until = ((max(last_heard, asked) + quiet_ms / 1000.0 - clock()) * 1000.0) as i64 + 10;
+            wait = max(10, min(wait, until));
+        }
+        let more = pump(if done { 300 } else { wait }) { m, method, id => true };
         if gone {
             out.append("{\"ok\":false,\"gone\":true,\"error\":\"the language server stopped before it answered\"}");
             return;
         }
         if done && !more { settled = true; break; }
+        let quiet = quiet_ms / 1000.0;
+        if !after_check && quiet_ms > 0 && !importing && current && clock() - asked >= quiet &&
+           clock() - max(last_heard, asked) >= quiet { settled = true; break; }
     }
     // A set the server says is for older text is not returned as this text's.
     let ver = diag_ver.get(key);
@@ -655,7 +673,8 @@ export "golsp_lib_ask" fn ask(question: const u8[:]) -> const u8[:] {
         if sync_file(file) { answer.append("{\"ok\":true}"); } else { answer.append("{\"ok\":false,\"error\":\"cannot read the file\"}"); }
         return answer;
     }
-    if o_ok && op == "diagnostics" && f_ok { diagnostics(file, s_ok && settle == "check", answer); }
+    let quiet_ms, q_ok = json::as_i64(json::member(q, "quiet_ms"));
+    if o_ok && op == "diagnostics" && f_ok { diagnostics(file, s_ok && settle == "check", if q_ok { quiet_ms } else { 0 }, answer); }
     else if o_ok && op == "implementations" && f_ok {
         let ln, l_ok = json::as_i64(json::member(q, "line"));
         let cn, c_ok = json::as_i64(json::member(q, "col"));
