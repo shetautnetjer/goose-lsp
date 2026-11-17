@@ -57,7 +57,8 @@ try:
         answers[name] = json.loads(body)
     expected = {"malformed", "unknown", "missing-file", "missing-position", "first", "changed",
                 "implementations", "stopped", "death-request", "dead", "failed-start", "quiet-error", "quiet-dies",
-                "special-name", "init-rejected", "late-first", "late-second", "late-diagnostics", "silent-clean", "trickle-late"}
+                "special-name", "init-rejected", "late-first", "late-second", "late-diagnostics", "silent-clean", "trickle-late",
+                "pull-during-import", "pull-fixed", "pull-broken-again"}
     require(set(answers) == expected, f"missing or extra answers: {set(answers) ^ expected}")
     for name in ("malformed", "unknown", "missing-file", "missing-position"):
         require(answers[name].get("ok") is False and answers[name].get("error"), f"{name} must fail")
@@ -84,6 +85,12 @@ try:
             f"a server silent on a clean file answers after quiet_ms: {answers['silent-clean']}")
     require(answers["trickle-late"].get("ok") is True and len(answers["trickle-late"].get("diagnostics", [])) == 1,
             f"a message during the silence restarts it, so the later set is the answer: {answers['trickle-late']}")
+    pulled = {"ok": True, "diagnostics": [{"line": 1, "col": 1, "end_line": 1, "end_col": 7, "severity": "error",
+                                           "source": "mock", "code": "", "message": "type mismatch"}]}
+    require(answers["pull-during-import"] == pulled,
+            f"a pulled answer waits for the workspace import to finish, whatever was published meanwhile: {answers['pull-during-import']}")
+    require(answers["pull-fixed"] == {"ok": True, "diagnostics": []}, f"pulled after a fix: {answers['pull-fixed']}")
+    require(answers["pull-broken-again"] == pulled, f"pulled after breaking it again: {answers['pull-broken-again']}")
     require(answers["death-request"].get("ok") is False, "request interrupted by EOF must fail")
     for name in ("stopped", "dead", "failed-start"):
         require(answers[name].get("ok") is False and answers[name].get("gone") is True, f"{name} must report gone")
@@ -122,14 +129,14 @@ try:
     require(not running(process["pid"]) and not running(child), "stop must terminate server and child group")
     died = records("die")
     require(any(row == {"kind": "exit", "value": {"reason": "deliberate EOF"}} for row in died), "death fixture ran")
-    print("PASS goose-lsp standalone: 18 answers; initialization, configuration, framing, synchronization,")
+    print("PASS goose-lsp standalone: 21 answers; initialization, configuration, framing, synchronization,")
     print("diagnostics, implementations, graceful stop/group cleanup, EOF and failed executable,")
     print("error answers, a server that never reports indexing, death during diagnostics, encoded URIs,")
-    print("a rejected initialize, late indexing signals, a set for older text.")
+    print("a rejected initialize, late indexing signals, a set for older text, pulled diagnostics.")
     print(f"Evidence: {fixture}")
 finally:
     # Only fixture-owned process groups, including when a consumer assertion fails.
-    for mode in ("normal", "die", "quiet", "initfail", "late"):
+    for mode in ("normal", "die", "quiet", "initfail", "late", "ij"):
         for row in records(mode):
             if row["kind"] == "process":
                 try:
