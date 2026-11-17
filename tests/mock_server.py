@@ -81,6 +81,26 @@ while (message := read_message()) is not None:
         # "quiet" is a server that never reports its indexing (pyright, typescript).
         if mode not in ("quiet", "late"):
             notify("experimental/serverStatus", {"quiescent": True})
+        if mode == "ij":
+            # JetBrains' IntelliJ server (Kotlin), as recorded 2026-11-17: it
+            # imports the workspace after it is up, its import log says
+            # "succeeded" long before it can analyse, and the import is over
+            # when its progress ends and it says FINISHED.
+            notify("intellij/workspaceImportStatus", {"blockedFolders": []})
+            def import_started():
+                notify("$/progress", {"token": "k3f9importing", "value": {"kind": "begin", "title": "Importing"}})
+                notify("intellij/importLog", {"type": 3, "message": "Importing with Gradle", "started": True,
+                                              "succeeded": False, "failed": False})
+            def import_logged():
+                notify("intellij/importLog", {"type": 3, "message": "Workspace imported successfully", "started": False,
+                                              "succeeded": True, "failed": False})
+            def import_finished():
+                globals()["ij_ready"] = True
+                notify("$/progress", {"token": "k3f9importing", "value": {"kind": "end"}})
+                notify("intellij/workspaceImportState", {"phase": "FINISHED", "folders": []})
+            threading.Timer(0.3, import_started).start()
+            threading.Timer(0.5, import_logged).start()
+            threading.Timer(1.2, import_finished).start()
         if mode == "normal":
             child = subprocess.Popen([sys.executable, __file__, "child"])
             record("child", {"pid": child.pid})
@@ -93,6 +113,19 @@ while (message := read_message()) is not None:
     elif method == "textDocument/didChange":
         documents[params["textDocument"]["uri"]] = params["contentChanges"][0]["text"]
         versions[params["textDocument"]["uri"]] = params["textDocument"]["version"]
+    elif method == "textDocument/diagnostic" and mode == "ij":
+        # Pulled: right once the import is over, empty before (nothing is analysed yet).
+        uri = params["textDocument"]["uri"]
+        items = []
+        if globals().get("ij_ready") and documents.get(uri) == "broken\n":
+            items = [{"range": {"start": {"line": 0, "character": 0}, "end": {"line": 0, "character": 6}},
+                      "severity": 1, "source": "mock", "message": "type mismatch"}]
+        response(message["id"], {"kind": "full", "items": items})
+    elif method == "textDocument/didSave" and mode == "ij":
+        # Published too, for the current version, and empty before the
+        # import is over: the set that must not be taken for the answer.
+        uri = params["textDocument"]["uri"]
+        notify("textDocument/publishDiagnostics", {"uri": uri, "version": versions.get(uri, 1), "diagnostics": []})
     elif method == "textDocument/didSave" and mode == "quiet":
         # The second save is the diagnostics question's: die while it waits.
         saves = globals().get("saves", 0) + 1

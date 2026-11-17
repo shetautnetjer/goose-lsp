@@ -8,7 +8,7 @@
 // Swan (github.com/shetautnetjer/Swan) is its first user.
 //
 // Questions and answers are JSON. Positions are 1-based:
-//   {"op":"diagnostics","file":"src/lib.rs","settle":"check"|"publish","quiet_ms":3000?}
+//   {"op":"diagnostics","file":"src/lib.rs","settle":"check"|"publish"|"pull","quiet_ms":3000?}
 //     -> {"ok":true,"diagnostics":[{"line":..,"col":..,"end_line":..,"end_col":..,
 //         "severity":"error","source":"rustc","code":"E0061","message":".."}]}
 //   {"op":"open","file":"src/lib.rs"} -> {"ok":true}, at once: the server starts on it
@@ -48,6 +48,11 @@ var language_id: u8[>..];       // what didOpen says the files are: rust, python
 var checks_ended = 0;
 var last_heard = 0.0;           // when the server last sent anything (clock())
 var importing = false;          // the Kotlin server is importing the build (Gradle) and has not finished
+var import_logged = false;      // its import log said the import ended; the progress it began may still run
+var active_progress = 0;        // $/progress tokens begun and not ended
+var ij_server = false;          // an IntelliJ server (it sent an intellij/ notification): it imports its workspace first
+var ij_ready = false;           // ... and has said, at least once, that the import is finished
+var started_at = 0.0;           // when this session started (clock())
 var import_failed: u8[>..];     // why the last import failed, if it did           // flycheck runs finished, ever: a question waits for the next one
 var gone = false;               // the server has died; this runs inside the host, so never exit
 var trace = false;              // GOLSP_TRACE=1: every message from the server goes to the log
@@ -215,6 +220,13 @@ fn pump<F>(timeout_ms: i64) -> bool {
             let p = json::member(root, "params");
             let token, t_ok = json::as_string(json::member(p, "token"));
             let kind, k_ok = json::as_string(json::member(json::member(p, "value"), "kind"));
+            if k_ok {
+                // Any work the server reports: the IntelliJ server's import
+                // and indexing run under tokens with random names.
+                if kind == "begin" { active_progress++; }
+                else if kind == "end" && active_progress > 0 { active_progress--; }
+                if import_logged && active_progress == 0 { importing = false; }
+            }
             if t_ok && k_ok {
                 if find(token, "ndexing") >= 0 || find(token, "cachePriming") >= 0 {
                     index_signals = true;
@@ -239,8 +251,15 @@ fn pump<F>(timeout_ms: i64) -> bool {
             let st, st_ok = json::as_bool(json::member(p, "started"));
             let ok, ok_ok = json::as_bool(json::member(p, "succeeded"));
             let bad, bad_ok = json::as_bool(json::member(p, "failed"));
-            if st_ok && st { importing = true; import_failed.clear(); }
-            if (ok_ok && ok) || (bad_ok && bad) { importing = false; }
+            if st_ok && st { importing = true; import_logged = false; import_failed.clear(); }
+            // "Workspace imported successfully" comes seconds before the
+            // server can analyse anything: its Importing and Indexing
+            // progress still runs (2.2 s against 6.0 s on a small Gradle
+            // project, 2026-11-17), and a file checked in between has no
+            // errors. So the import is over when that progress has ended,
+            // or when the server says FINISHED below. A failed one is over.
+            if ok_ok && ok { import_logged = true; if active_progress == 0 { importing = false; } }
+            if bad_ok && bad { import_logged = true; importing = false; }
             if bad_ok && bad {
                 let m, m_ok = json::as_string(json::member(p, "message"));
                 var why: u8[>..] = [];
@@ -248,6 +267,11 @@ fn pump<F>(timeout_ms: i64) -> bool {
                 import_failed.clear();
                 import_failed.append(why);
             }
+        }
+        if has_method && starts_with(method, "intellij/") { ij_server = true; }
+        if has_method && method == "intellij/workspaceImportState" {
+            let ph, ph_ok = json::as_string(json::member(json::member(root, "params"), "phase"));
+            if ph_ok && ph == "FINISHED" { importing = false; import_logged = true; ij_ready = true; }
         }
         if has_method && method == "textDocument/publishDiagnostics" { keep_diagnostics(json::member(root, "params")); }
         if F(root, if has_method { method } else { "" }, idt[..]) { return true; }
@@ -397,15 +421,19 @@ fn sev_word(n: i64) -> const u8[:] {
 fn keep_diagnostics(p: json::Node?) {
     let u, u_ok = json::as_string(json::member(p, "uri"));
     guard u_ok;
+    let ver, v_ok = json::as_i64(json::member(p, "version"));
+    keep_set(u, v_ok, if v_ok { ver } else { 0 }, json::member(p, "diagnostics"));
+}
+
+// Keeps one file's set: a published one, or the items of a pulled report.
+fn keep_set(u: const u8[:], v_ok: bool, ver: i64, ds: json::Node?) {
     var key: u8[..1024] = [];
     guard diag_key(u, key);
     compact_diagnostics();
-    let ver, v_ok = json::as_i64(json::member(p, "version"));
     if v_ok { diag_ver.insert(key, ver); } else { diag_ver.remove(key); }
     let start = diag_text.len;
     diag_text.push('[');
     var n = 0;
-    let ds = json::member(p, "diagnostics");
     if ds {
         json::each(ds) { d =>
             if n > 0 { diag_text.push(','); }
@@ -537,6 +565,92 @@ fn diagnostics(file: const u8[:], after_check: bool, quiet_ms: i64, out: u8[>..]
     out.push('}');
 }
 
+// The diagnostics for a file as it is on disk now, asked for
+// (textDocument/diagnostic) rather than waited for: `"settle":"pull"`, for a
+// server that answers that request. JetBrains' IntelliJ server (Kotlin) is
+// one: asked once its workspace import is over, it answers for the text it
+// was last sent, in about 60 ms. What it publishes cannot be used the same
+// way: a set computed before the import ended is empty and carries the
+// current version, so "published for this text" does not mean "analysed".
+//
+// It is asked only when it is ready: not importing, no work in progress,
+// and, for an IntelliJ server, after it has said once that the import is
+// finished (it starts importing a second or two after it is up; half a
+// minute without a word means there is nothing to import). If it starts
+// importing while it answers, it is asked again afterwards.
+fn pull_diagnostics(file: const u8[:], out: u8[>..]&) {
+    pump(20) { m, method, id => false };
+    var key: u8[..1024] = [];
+    guard diag_key(uri_of(file), key) else { out.append("{\"ok\":false,\"error\":\"the path is too long\"}"); return; }
+    guard sync_file(file) else { out.append("{\"ok\":false,\"error\":\"cannot read the file\"}"); return; }
+    var fkey: u8[..1024] = [];
+    format(fkey, file);
+    let synced = opened.get(fkey);
+    var params: u8[>..] = [];
+    params.append("{\"textDocument\":{\"uri\":");
+    json::format_string(params, uri_of(file));
+    params.append("}}");
+    var deadline = clock() + 120.0;
+    var long_wait = false;
+    var settled = false;
+    var failed: u8[>..] = [];
+    loop {
+        // A first build import (Gradle fetching itself and the dependencies)
+        // can take minutes; anything else gets two.
+        if importing && !long_wait { deadline = clock() + 900.0; long_wait = true; }
+        let left = ((deadline - clock()) * 1000.0) as i64;
+        if left <= 0 { break; }
+        let since_start = clock() - started_at;
+        let first_import_due = !ij_ready && (since_start < 3.0 || (ij_server && since_start < 30.0));
+        if importing || active_progress > 0 || first_import_due {
+            pump(min(left, 250)) { m, method, id => true };
+            if gone {
+                out.append("{\"ok\":false,\"gone\":true,\"error\":\"the language server stopped before it answered\"}");
+                return;
+            }
+            continue;
+        }
+        let id = request("textDocument/diagnostic", params);
+        let want = str(id);
+        var got = false;
+        pump(left) { m, method, idt =>
+            let mine = method.len == 0 && idt == want;
+            if mine && json::member(m, "error") {
+                let msg, m_ok = json::as_string(json::member(json::member(m, "error"), "message"));
+                failed.append(if m_ok { msg } else { "the server answered with an error" });
+                got = true;
+            } else if mine {
+                keep_set(uri_of(file), if synced { true } else { false }, if synced { synced } else { 0 },
+                         json::member(json::member(m, "result"), "items"));
+                got = true;
+            }
+            got
+        };
+        if gone {
+            out.append("{\"ok\":false,\"gone\":true,\"error\":\"the language server stopped before it answered\"}");
+            return;
+        }
+        if failed.len > 0 {
+            out.append("{\"ok\":false,\"error\":");
+            json::format_string(out, failed);
+            out.push('}');
+            return;
+        }
+        guard got else { break; }
+        if importing || active_progress > 0 { continue; }
+        settled = true;
+        break;
+    }
+    let at = diag_at.get(key);
+    out.append("{\"ok\":true,");
+    if !settled { out.append("\"settled\":false,"); }
+    if import_failed.len > 0 { out.append("\"import_failed\":"); json::format_string(out, import_failed); out.push(','); }
+    out.append("\"diagnostics\":");
+    let len = diag_len.get(key);
+    if settled && at && len { out.append(diag_text[at..at + len]); } else { out.append("[]"); }
+    out.push('}');
+}
+
 // textDocument/implementation at a position.
 fn implementations(file: const u8[:], line: i64, col: i64, out: u8[>..]&) {
     guard sync_file(file) else { out.append("{\"ok\":false,\"error\":\"cannot read the file\"}"); return; }
@@ -596,6 +710,7 @@ export "golsp_lib_start" fn start(repo: const u8[:], log: const u8[:], init_json
     repo_dir.clear(); root_uri.clear(); log_path.clear(); init_options.clear(); inbox.clear(); opened.clear();
     language_id.clear(); language_id.append(lang_id);
     gone = false; indexing_done = false; index_signals = false; index_silent = false; checking = 0; checks_ended = 0; importing = false; import_failed.clear();
+    import_logged = false; active_progress = 0; ij_server = false; ij_ready = false; started_at = clock();
     diag_text.clear(); diag_at.clear(); diag_len.clear(); diag_seq.clear(); diag_ver.clear(); publishes = 0;
     var tv: u8[>..] = [];
     trace = env("GOLSP_TRACE", tv) && tv == "1";
@@ -674,7 +789,8 @@ export "golsp_lib_ask" fn ask(question: const u8[:]) -> const u8[:] {
         return answer;
     }
     let quiet_ms, q_ok = json::as_i64(json::member(q, "quiet_ms"));
-    if o_ok && op == "diagnostics" && f_ok { diagnostics(file, s_ok && settle == "check", if q_ok { quiet_ms } else { 0 }, answer); }
+    if o_ok && op == "diagnostics" && f_ok && s_ok && settle == "pull" { pull_diagnostics(file, answer); }
+    else if o_ok && op == "diagnostics" && f_ok { diagnostics(file, s_ok && settle == "check", if q_ok { quiet_ms } else { 0 }, answer); }
     else if o_ok && op == "implementations" && f_ok {
         let ln, l_ok = json::as_i64(json::member(q, "line"));
         let cn, c_ok = json::as_i64(json::member(q, "col"));

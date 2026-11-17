@@ -86,6 +86,19 @@ fn main() {
     ask("late-diagnostics", "{\"op\":\"diagnostics\",\"file\":\"sample.ts\",\"settle\":\"publish\"}");
     golsp_stop();
 
+    // A server that is asked (textDocument/diagnostic): JetBrains' IntelliJ
+    // server. Before its workspace import is over it answers, and publishes,
+    // an empty set for the current text; the answer waits for the import.
+    let ij = server_args(a[2], a[3], "ij", repo);
+    assert(write_file(str(repo, "/sample.ts"), "broken\n"));
+    assert(golsp_start(repo, str(repo, "/ij.log"), "{}", ij, "", "kotlin"));
+    ask("pull-during-import", "{\"op\":\"diagnostics\",\"file\":\"sample.ts\",\"settle\":\"pull\"}");
+    assert(write_file(str(repo, "/sample.ts"), "fixed\n"));
+    ask("pull-fixed", "{\"op\":\"diagnostics\",\"file\":\"sample.ts\",\"settle\":\"pull\"}");
+    assert(write_file(str(repo, "/sample.ts"), "broken\n"));
+    ask("pull-broken-again", "{\"op\":\"diagnostics\",\"file\":\"sample.ts\",\"settle\":\"pull\"}");
+    golsp_stop();
+
     var absent: u8[>..] = [];
     absent.append(str(repo, "/no-such-server")); absent.push(0);
     assert(!golsp_start(repo, str(repo, "/absent.log"), "{}", absent, "", "typescript"));

@@ -64,7 +64,7 @@ is sent as `initializationOptions` and answers `workspace/configuration` by
 section. Questions:
 
 ```
-{"op":"diagnostics","file":"src/lib.rs","settle":"check"}     // or "publish"
+{"op":"diagnostics","file":"src/lib.rs","settle":"check"}     // or "publish", or "pull"
   -> {"ok":true,"diagnostics":[{"line":12,"col":5,"end_line":12,"end_col":9,
       "severity":"error","source":"rustc","code":"E0061","message":"..."}]}
 {"op":"implementations","file":"src/lib.rs","line":12,"col":11}
@@ -76,8 +76,13 @@ section. Questions:
 Positions are 1-based. Each question re-reads its file from disk and syncs it
 (didOpen, or didChange and didSave). `settle: "check"` waits for the check a
 save starts (rust-analyzer's cargo check); `"publish"` waits for the file's
-next published set (pyright, the TypeScript and Kotlin servers). A Kotlin
-build import (Gradle) is waited for. A server that dies is reported as
+next published set (pyright, the TypeScript server); `"pull"` asks the server
+(`textDocument/diagnostic`) once it is ready, for a server that answers that
+request: JetBrains' IntelliJ server for Kotlin. That server's workspace
+import (Gradle) is waited for; it is over when the server says
+`intellij/workspaceImportState` FINISHED, not when its import log says
+"succeeded", which comes seconds earlier. What it publishes in between is
+an empty set for the current text, which is why it is asked instead. A server that dies is reported as
 `"gone":true`, never fatal. Servers run in their own process group and are
 killed whole on stop. A thread of the shim reads the server's output as it
 comes, so a server busy indexing never blocks on a full pipe while the host
