@@ -9,6 +9,7 @@
 //
 // Questions and answers are JSON. Positions are 1-based:
 //   {"op":"diagnostics","file":"src/lib.rs","settle":"check"|"publish"|"pull","quiet_ms":3000?}
+//   {"op":"request","method":"textDocument/documentSymbol","file":"src/lib.rs","line":1?,"col":1?,"more":"..."?}
 //     -> {"ok":true,"diagnostics":[{"line":..,"col":..,"end_line":..,"end_col":..,
 //         "severity":"error","source":"rustc","code":"E0061","message":".."}]}
 //   {"op":"open","file":"src/lib.rs"} -> {"ok":true}, at once: the server starts on it
@@ -348,6 +349,8 @@ fn repo_path_of(uri: const u8[:], out: u8[>..]&) -> bool {
 
 // Documents the server has, by path, with their version.
 var opened = dictionary<u8[..1024], i64> {};
+var synced = dictionary<u8[..1024], u64> {};   // the hash of the text each file was last sent with
+var sync_sent = false;          // whether the last sync_if_changed had to send the file
 
 // Tells the server the file's current text: opened, or changed and saved,
 // so rust-analyzer's own diagnostics and its cargo check both run.
@@ -366,6 +369,7 @@ fn sync_file(file: const u8[:]) -> bool {
     guard read_file(str(repo_dir, "/", file), text) else { return false; }
     var key: u8[..1024] = [];
     format(key, file);
+    synced.insert(key, hash(text) | 1);
     var params: u8[>..] = [];
     let uri = uri_of(file);
     let v = opened.get(key);
@@ -395,6 +399,24 @@ fn sync_file(file: const u8[:]) -> bool {
     params.append("}}");
     notify("textDocument/didSave", params);
     return true;
+}
+
+// Sends the file only when its text is not what the server already has:
+// a question about an unchanged file should not make the server analyse the
+// program again (Goose's server took 0.3 s a question that way, 3.6 minutes
+// for the 636 definitions of one repo).
+fn sync_if_changed(file: const u8[:]) -> bool {
+    var text: u8[>..] = [];
+    guard read_file(str(repo_dir, "/", file), text) else { return false; }
+    var key: u8[..1024] = [];
+    format(key, file);
+    let was = synced.get(key);
+    if was {
+        let h: u64 = was;
+        if h == (hash(text) | 1) { sync_sent = false; return true; }
+    }
+    sync_sent = true;
+    return sync_file(file);
 }
 
 // Waits for a server that reports its indexing to finish it. One that has
@@ -652,6 +674,48 @@ fn pull_diagnostics(file: const u8[:], out: u8[>..]&) {
 }
 
 // textDocument/implementation at a position.
+// Any request about a file, answered with the server's own result:
+//   {"op":"request","method":"textDocument/references","file":F,"line":L,"col":C,
+//    "more":"\"context\":{\"includeDeclaration\":false}"}
+// params are {"textDocument":{"uri":...}}, plus "position" when line and col
+// (1-based) are given, plus the members in `more` as written. The answer is
+// {"ok":true,"result":<the server's result, as it sent it>}: document
+// symbols, references, a definition, hover, whatever the server offers.
+fn raw_request(file: const u8[:], method: const u8[:], line: i64, col: i64, more: const u8[:], out: u8[>..]&) {
+    guard sync_if_changed(file) else { out.append("{\"ok\":false,\"error\":\"cannot read the file\"}"); return; }
+    // Nothing new was sent: the server has nothing to index before it answers.
+    if sync_sent { wait_indexed(); }
+    var params: u8[>..] = [];
+    params.append("{\"textDocument\":{\"uri\":");
+    json::format_string(params, uri_of(file));
+    params.push('}');
+    if line > 0 && col > 0 { format(params, ",\"position\":{\"line\":", line - 1, ",\"character\":", col - 1, "}"); }
+    if more.len > 0 { params.push(','); params.append(more); }
+    params.push('}');
+    let id = request(method, params);
+    let want = str(id);
+    var answered = false;
+    pump(120000) { m, mth, idt =>
+        let mine = mth.len == 0 && idt == want;
+        if mine && json::member(m, "error") {
+            let msg, m_ok = json::as_string(json::member(json::member(m, "error"), "message"));
+            out.append("{\"ok\":false,\"error\":");
+            json::format_string(out, if m_ok { msg } else { "the server answered with an error" });
+            out.push('}');
+            answered = true;
+        } else if mine {
+            out.append("{\"ok\":true,\"result\":");
+            let res = json::member(m, "result");
+            if res { write_json(res, out); } else { out.append("null"); }
+            out.push('}');
+            answered = true;
+        }
+        mine
+    };
+    if !answered && gone { out.append("{\"ok\":false,\"gone\":true,\"error\":\"the language server stopped before it answered\"}"); }
+    else if !answered { out.append("{\"ok\":false,\"error\":\"the language server did not answer in time\"}"); }
+}
+
 fn implementations(file: const u8[:], line: i64, col: i64, out: u8[>..]&) {
     guard sync_file(file) else { out.append("{\"ok\":false,\"error\":\"cannot read the file\"}"); return; }
     wait_indexed();
@@ -707,7 +771,7 @@ var answer: u8[>..];
 export "golsp_lib_start" fn start(repo: const u8[:], log: const u8[:], init_json: const u8[:], argv: const u8[:],
                                env_vars: const u8[:], lang_id: const u8[:]) -> bool {
     // A fresh session, also after a server died.
-    repo_dir.clear(); root_uri.clear(); log_path.clear(); init_options.clear(); inbox.clear(); opened.clear();
+    repo_dir.clear(); root_uri.clear(); log_path.clear(); init_options.clear(); inbox.clear(); opened.clear(); synced.clear();
     language_id.clear(); language_id.append(lang_id);
     gone = false; indexing_done = false; index_signals = false; index_silent = false; checking = 0; checks_ended = 0; importing = false; import_failed.clear();
     import_logged = false; active_progress = 0; ij_server = false; ij_ready = false; started_at = clock();
@@ -796,6 +860,17 @@ export "golsp_lib_ask" fn ask(question: const u8[:]) -> const u8[:] {
         let cn, c_ok = json::as_i64(json::member(q, "col"));
         if l_ok && c_ok { implementations(file, ln, cn, answer); }
         else { answer.append("{\"ok\":false,\"error\":\"line and col are required\"}"); }
+    } else if o_ok && op == "request" && f_ok {
+        let mth, m_ok = json::as_string(json::member(q, "method"));
+        let ln, l_ok = json::as_i64(json::member(q, "line"));
+        let cn, c_ok = json::as_i64(json::member(q, "col"));
+        let more, mo_ok = json::as_string(json::member(q, "more"));
+        var method: u8[>..] = [];       // copies: the request reuses the buffers these sit in
+        var extra: u8[>..] = [];
+        if m_ok { method.append(mth); }
+        if mo_ok { extra.append(more); }
+        if m_ok { raw_request(file, method, if l_ok { ln } else { 0 }, if c_ok { cn } else { 0 }, extra, answer); }
+        else { answer.append("{\"ok\":false,\"error\":\"method is required\"}"); }
     } else {
         answer.append("{\"ok\":false,\"error\":\"unknown question\"}");
     }

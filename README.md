@@ -69,6 +69,8 @@ section. Questions:
       "severity":"error","source":"rustc","code":"E0061","message":"..."}]}
 {"op":"implementations","file":"src/lib.rs","line":12,"col":11}
   -> {"ok":true,"locations":[{"file":"src/lib.rs","line":23,"col":1}]}
+{"op":"request","method":"textDocument/references","file":"src/lib.rs","line":12,"col":11,"more":"\"context\":{\"includeDeclaration\":false}"}
+  -> {"ok":true,"result":[...]}   // the server's own result; line, col and more are optional
 {"op":"open","file":"src/lib.rs"}
   -> {"ok":true}    // at once; the server starts loading the project
 ```
