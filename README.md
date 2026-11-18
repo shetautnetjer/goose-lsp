@@ -68,8 +68,9 @@ section. Questions:
   -> {"ok":true,"diagnostics":[{"line":12,"col":5,"end_line":12,"end_col":9,
       "severity":"error","source":"rustc","code":"E0061","message":"..."}]}
 {"op":"implementations","file":"src/lib.rs","line":12,"col":11}
-{"op":"request","method":"textDocument/references","file":"src/lib.rs","line":12,"col":11,"more":"\"context\":{\"includeDeclaration\":false}"}
   -> {"ok":true,"locations":[{"file":"src/lib.rs","line":23,"col":1}]}
+{"op":"request","method":"textDocument/references","file":"src/lib.rs","line":12,"col":11,"more":"\"context\":{\"includeDeclaration\":false}"}
+  -> {"ok":true,"result":[...]}   // the server's own result; line, col and more are optional
 {"op":"open","file":"src/lib.rs"}
   -> {"ok":true}    // at once; the server starts loading the project
 ```
