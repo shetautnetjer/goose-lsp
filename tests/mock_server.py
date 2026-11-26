@@ -42,6 +42,14 @@ def send_now(value, fragment):
         sys.stdout.buffer.flush()
 
 
+# rust-analyzer's status messages, as it words them (0.3.3089): a build script
+# that failed, and standard library sources that are not installed.
+BUILD_SCRIPTS = ("Failed to run build scripts of some packages.\n"
+                 "Please refer to the language server logs for more details on the errors.")
+SYSROOT = ("Workspace `fixture/Cargo.toml` has sysroot errors: can't load standard library from sysroot\n"
+           "/opt/none\ntry installing `rust-src` the same way you installed `rustc`")
+
+
 def notify(method, params):
     send({"jsonrpc": "2.0", "method": method, "params": params})
 
@@ -79,7 +87,13 @@ while (message := read_message()) is not None:
             "textDocumentSync": 1, "implementationProvider": True}}}, fragment=True)
     elif method == "initialized":
         # "quiet" is a server that never reports its indexing (pyright, typescript).
-        if mode not in ("quiet", "late"):
+        if mode == "health":
+            notify("experimental/serverStatus", {
+                "quiescent": True,
+                "health": "warning",
+                "message": BUILD_SCRIPTS,
+            })
+        elif mode not in ("quiet", "late"):
             notify("experimental/serverStatus", {"quiescent": True})
         if mode == "ij":
             # JetBrains' IntelliJ server (Kotlin), as recorded 2026-11-17: it
@@ -153,6 +167,26 @@ while (message := read_message()) is not None:
         threading.Timer(0.85, notify, ["textDocument/publishDiagnostics", {"uri": uri, "diagnostics": [
             {"range": {"start": {"line": 0, "character": 0}, "end": {"line": 0, "character": 1}},
              "severity": 1, "message": "late"}]}]).start()
+    elif method == "textDocument/didSave" and mode == "health":
+        # A check-settled server (rust-analyzer) reporting its health: a check
+        # that did not run with nothing published, a warning that leaves the
+        # check alone, a check that did not run with an error published, and ok.
+        uri = params["textDocument"]["uri"]
+        text = documents.get(uri, "")
+        if text == "ok\n":
+            notify("experimental/serverStatus", {"quiescent": True, "health": "ok"})
+        elif text == "sysroot\n":
+            notify("experimental/serverStatus", {"quiescent": True, "health": "warning", "message": SYSROOT})
+        else:
+            notify("experimental/serverStatus", {"quiescent": True, "health": "warning", "message": BUILD_SCRIPTS})
+        notify("$/progress", {"token": "flycheck-fixture", "value": {"kind": "begin"}})
+        if text == "broken\n":
+            notify("textDocument/publishDiagnostics", {"uri": uri, "diagnostics": [
+                {"range": {"start": {"line": 0, "character": 0}, "end": {"line": 0, "character": 6}},
+                 "severity": 1, "source": "rustc", "code": "E0308", "message": "mismatched types"}]})
+        elif text == "ok\n":
+            notify("textDocument/publishDiagnostics", {"uri": uri, "diagnostics": []})
+        notify("$/progress", {"token": "flycheck-fixture", "value": {"kind": "end"}})
     elif method == "textDocument/didSave":
         uri = params["textDocument"]["uri"]
         notify("$/progress", {"token": "flycheck-fixture", "value": {"kind": "begin"}})

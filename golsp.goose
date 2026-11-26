@@ -12,6 +12,9 @@
 //   {"op":"request","method":"textDocument/documentSymbol","file":"src/lib.rs","line":1?,"col":1?,"more":"..."?}
 //     -> {"ok":true,"diagnostics":[{"line":..,"col":..,"end_line":..,"end_col":..,
 //         "severity":"error","source":"rustc","code":"E0061","message":".."}]}
+//        or {"ok":false,"settled":false,"error":"not settled: ..."} when
+//        settle is "check", the server's status says the check did not run,
+//        and no error was published for the file
 //   {"op":"open","file":"src/lib.rs"} -> {"ok":true}, at once: the server starts on it
 //   {"op":"implementations","file":"src/lib.rs","line":12,"col":11}
 //     -> {"ok":true,"locations":[{"file":"src/lib.rs","line":23,"col":1}]}
@@ -55,6 +58,8 @@ var ij_server = false;          // an IntelliJ server (it sent an intellij/ noti
 var ij_ready = false;           // ... and has said, at least once, that the import is finished
 var started_at = 0.0;           // when this session started (clock())
 var import_failed: u8[>..];     // why the last import failed, if it did           // flycheck runs finished, ever: a question waits for the next one
+var server_health: u8[>..];     // last health from experimental/serverStatus; empty until heard
+var server_status_msg: u8[>..]; // last message from experimental/serverStatus
 var gone = false;               // the server has died; this runs inside the host, so never exit
 var trace = false;              // GOLSP_TRACE=1: every message from the server goes to the log
 // The latest diagnostics the server published for each file, as our JSON:
@@ -66,6 +71,7 @@ var diag_at = dictionary<u8[..1024], i64> {};
 var diag_len = dictionary<u8[..1024], i64> {};
 var diag_seq = dictionary<u8[..1024], i64> {};  // which publish, counting from the session's start
 var diag_ver = dictionary<u8[..1024], i64> {};  // the document version a set is for, when the server says
+var diag_errors = dictionary<u8[..1024], i64> {}; // error-severity diagnostics in the file's last set
 var publishes = 0;
 
 fn note(s: const u8[:]) { append_file(log_path, str(s, "\n")); }
@@ -239,11 +245,30 @@ fn pump<F>(timeout_ms: i64) -> bool {
                 }
             }
         }
-        // rust-analyzer says when it has nothing left to load or index.
+        // rust-analyzer says when it has nothing left to load or index, and
+        // how it is doing ("ok", "warning" or "error") with its reasons.
         if has_method && method == "experimental/serverStatus" {
             index_signals = true;
-            let q, q_ok = json::as_bool(json::member(json::member(root, "params"), "quiescent"));
+            let p = json::member(root, "params");
+            let q, q_ok = json::as_bool(json::member(p, "quiescent"));
             if q_ok && q { indexing_done = true; }
+            let h, h_ok = json::as_string(json::member(p, "health"));
+            let sm, sm_ok = json::as_string(json::member(p, "message"));
+            if h_ok {
+                var hv: u8[>..] = [];
+                var mv: u8[>..] = [];
+                hv.append(h);
+                if sm_ok { mv.append(sm); }
+                server_health.clear();
+                server_health.append(hv);
+                server_status_msg.clear();
+                server_status_msg.append(mv);
+            } else if sm_ok {
+                var mv: u8[>..] = [];
+                mv.append(sm);
+                server_status_msg.clear();
+                server_status_msg.append(mv);
+            }
         }
         // JetBrains' Kotlin server imports the Gradle build before it can
         // analyse anything, and says when it starts and ends.
@@ -456,6 +481,7 @@ fn keep_set(u: const u8[:], v_ok: bool, ver: i64, ds: json::Node?) {
     let start = diag_text.len;
     diag_text.push('[');
     var n = 0;
+    var errors = 0;
     if ds {
         json::each(ds) { d =>
             if n > 0 { diag_text.push(','); }
@@ -466,6 +492,8 @@ fn keep_set(u: const u8[:], v_ok: bool, ver: i64, ds: json::Node?) {
             let el, a3 = json::as_i64(json::member(json::member(r, "end"), "line"));
             let ec, a4 = json::as_i64(json::member(json::member(r, "end"), "character"));
             let sv, s_ok = json::as_i64(json::member(d, "severity"));
+            let sev = if s_ok { sv } else { 1 };
+            if sev == 1 { errors++; }
             let msg, m_ok = json::as_string(json::member(d, "message"));
             let src, r_ok = json::as_string(json::member(d, "source"));
             var code: u8[>..] = [];
@@ -475,7 +503,7 @@ fn keep_set(u: const u8[:], v_ok: bool, ver: i64, ds: json::Node?) {
                 if c_ok { code.append(cs); } else { let ci, i_ok = json::as_i64(cn); if i_ok { format(code, ci); } }
             }
             format(diag_text, "{\"line\":", sl + 1, ",\"col\":", sc + 1, ",\"end_line\":", el + 1, ",\"end_col\":", ec + 1,
-                   ",\"severity\":\"", sev_word(if s_ok { sv } else { 1 }), "\",\"source\":");
+                   ",\"severity\":\"", sev_word(sev), "\",\"source\":");
             json::format_string(diag_text, if r_ok { src } else { "" });
             diag_text.append(",\"code\":");
             json::format_string(diag_text, code);
@@ -490,6 +518,7 @@ fn keep_set(u: const u8[:], v_ok: bool, ver: i64, ds: json::Node?) {
     diag_seq.insert(key, publishes);
     diag_at.insert(key, start);
     diag_len.insert(key, diag_text.len - start);
+    diag_errors.insert(key, errors);
 }
 
 // Older sets are dropped from diag_text once they are most of it, so a long
@@ -515,11 +544,55 @@ fn compact_diagnostics() {
     diag_text.append(kept);
 }
 
+// rust-analyzer's own words, in its status message, for a check that did
+// not judge the code: its flycheck could not run, or a build script failed,
+// which stops cargo before the crate itself is compiled. Its other warnings
+// (no standard library sources, no proc-macro server) leave cargo check as
+// it was, and a set with no error under them is clean. The answer is where
+// the first of the two begins in the message, or -1.
+fn check_not_run() -> i64 {
+    let scripts = find(server_status_msg, "Failed to run build scripts");
+    let flycheck = find(server_status_msg, "cargo check failed to start");
+    if scripts >= 0 && (flycheck < 0 || scripts < flycheck) { return scripts; }
+    return flycheck;
+}
+
+// What the server said from there on: the first two lines that hold text,
+// joined by one space, cut to 300 characters, one trailing ':' removed (what
+// follows them is a build log).
+fn server_status_why(from: i64, out: u8[>..]&) {
+    var joined: u8[>..] = [];
+    var lines = 0;
+    each_split(server_status_msg[from..], '\n') { line =>
+        let t = trim(line);
+        if t.len > 0 && lines < 2 {
+            if lines > 0 { joined.push(' '); }
+            joined.append(t);
+            lines++;
+        }
+    };
+    var chars = 0;
+    var cut = joined.len;
+    var i = 0;
+    while i < joined.len {
+        if (joined[i] & 0xC0) != 0x80 {
+            if chars == 300 { cut = i; break; }
+            chars++;
+        }
+        i++;
+    }
+    if cut > 0 && joined[cut - 1] == ':' { cut--; }
+    out.append(joined[..cut]);
+}
+
 // The diagnostics for a file as it is on disk now. The file is synced and
 // saved, and the answer comes once the server has had its say and been quiet
 // for a moment: with after_check (rust-analyzer), when the cargo check the
 // save started has finished, since it publishes only sets that changed;
 // otherwise (pyright, typescript) when it has published for this file.
+// With after_check, when the server's status says the check did not judge
+// the code (check_not_run) and the file's set holds no error, the set is
+// not a clean answer: ok:false, settled:false, "not settled: <its words>".
 // quiet_ms, for a server that publishes nothing for a file without
 // problems (lua-language-server on a clean file): once it has said nothing
 // for that long after the question, its last set (none: no problems) is the
@@ -576,6 +649,21 @@ fn diagnostics(file: const u8[:], after_check: bool, quiet_ms: i64, out: u8[>..]
     if ver && synced && ver < synced {
         out.append("{\"ok\":false,\"settled\":false,\"error\":\"the server has not published diagnostics for the current text yet\"}");
         return;
+    }
+    // A check the server says did not run has not looked at this file: the
+    // errors that were found are passed on, and no error is not "clean".
+    if after_check && settled && server_health.len > 0 && server_health != "ok" {
+        let from = check_not_run();
+        let errs = diag_errors.get(key);
+        if from >= 0 && (!errs || errs == 0) {
+            var why: u8[>..] = [];
+            why.append("not settled: ");
+            server_status_why(from, why);
+            out.append("{\"ok\":false,\"settled\":false,\"error\":");
+            json::format_string(out, why);
+            out.push('}');
+            return;
+        }
     }
     let at = diag_at.get(key);
     out.append("{\"ok\":true,");
@@ -774,8 +862,9 @@ export "golsp_lib_start" fn start(repo: const u8[:], log: const u8[:], init_json
     repo_dir.clear(); root_uri.clear(); log_path.clear(); init_options.clear(); inbox.clear(); opened.clear(); synced.clear();
     language_id.clear(); language_id.append(lang_id);
     gone = false; indexing_done = false; index_signals = false; index_silent = false; checking = 0; checks_ended = 0; importing = false; import_failed.clear();
+    server_health.clear(); server_status_msg.clear();
     import_logged = false; active_progress = 0; ij_server = false; ij_ready = false; started_at = clock();
-    diag_text.clear(); diag_at.clear(); diag_len.clear(); diag_seq.clear(); diag_ver.clear(); publishes = 0;
+    diag_text.clear(); diag_at.clear(); diag_len.clear(); diag_seq.clear(); diag_ver.clear(); diag_errors.clear(); publishes = 0;
     var tv: u8[>..] = [];
     trace = env("GOLSP_TRACE", tv) && tv == "1";
     format(repo_dir, repo);
