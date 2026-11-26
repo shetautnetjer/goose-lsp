@@ -7,7 +7,7 @@ this file have right now?" a fraction of a second after an edit, without a
 full rebuild. The servers themselves are separate programs; this is the
 client that drives them.
 
-**Status (2026-10-26):** 11 standalone checks pass against a fake language
+**Status (2026-11-26):** 27 standalone answers are checked against a fake language
 server (`scripts/test.sh`). In Swan it answers live errors 0.4 to 0.9 s after
 an edit with the real servers, and can start a server early so the first
 answer comes in about 0.7 s.
@@ -67,6 +67,7 @@ section. Questions:
 {"op":"diagnostics","file":"src/lib.rs","settle":"check"}     // or "publish", or "pull"
   -> {"ok":true,"diagnostics":[{"line":12,"col":5,"end_line":12,"end_col":9,
       "severity":"error","source":"rustc","code":"E0061","message":"..."}]}
+  -> {"ok":false,"settled":false,"error":"not settled: ..."}  // settle "check": the check did not run, no error found
 {"op":"implementations","file":"src/lib.rs","line":12,"col":11}
   -> {"ok":true,"locations":[{"file":"src/lib.rs","line":23,"col":1}]}
 {"op":"request","method":"textDocument/references","file":"src/lib.rs","line":12,"col":11,"more":"\"context\":{\"includeDeclaration\":false}"}
@@ -77,7 +78,13 @@ section. Questions:
 
 Positions are 1-based. Each question re-reads its file from disk and syncs it
 (didOpen, or didChange and didSave). `settle: "check"` waits for the check a
-save starts (rust-analyzer's cargo check); `"publish"` waits for the file's
+save starts (rust-analyzer's cargo check). When rust-analyzer's status says
+that check did not run (its flycheck could not start, or a build script
+failed) and no error was found in the file, the answer is
+`"ok":false,"settled":false` with `"error":"not settled: ..."` in the
+server's words, not a clean set; an error that was found is still returned.
+Its other warnings (no standard library sources, say) leave the check as it
+was. `"publish"` waits for the file's
 next published set (pyright, the TypeScript server); `"pull"` asks the server
 (`textDocument/diagnostic`) once it is ready, for a server that answers that
 request: JetBrains' IntelliJ server for Kotlin. That server's workspace

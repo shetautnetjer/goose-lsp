@@ -58,7 +58,8 @@ try:
     expected = {"malformed", "unknown", "missing-file", "missing-position", "first", "changed",
                 "implementations", "stopped", "death-request", "dead", "failed-start", "quiet-error", "quiet-dies",
                 "special-name", "init-rejected", "late-first", "late-second", "late-diagnostics", "silent-clean", "trickle-late",
-                "pull-during-import", "pull-fixed", "pull-broken-again"}
+                "pull-during-import", "pull-fixed", "pull-broken-again",
+                "check-warning-unsettled", "check-other-warning", "check-warning-with-error", "check-health-ok"}
     require(set(answers) == expected, f"missing or extra answers: {set(answers) ^ expected}")
     for name in ("malformed", "unknown", "missing-file", "missing-position"):
         require(answers[name].get("ok") is False and answers[name].get("error"), f"{name} must fail")
@@ -91,6 +92,19 @@ try:
             f"a pulled answer waits for the workspace import to finish, whatever was published meanwhile: {answers['pull-during-import']}")
     require(answers["pull-fixed"] == {"ok": True, "diagnostics": []}, f"pulled after a fix: {answers['pull-fixed']}")
     require(answers["pull-broken-again"] == pulled, f"pulled after breaking it again: {answers['pull-broken-again']}")
+    unsettled = answers["check-warning-unsettled"]
+    require(unsettled == {"ok": False, "settled": False,
+                          "error": "not settled: Failed to run build scripts of some packages. "
+                                   "Please refer to the language server logs for more details on the errors."},
+            f"a check the server says did not run, with nothing published, must not settle: {unsettled}")
+    require(answers["check-other-warning"] == {"ok": True, "diagnostics": []},
+            f"a warning that leaves the check alone is a clean answer: {answers['check-other-warning']}")
+    warn_err = {"ok": True, "diagnostics": [{"line": 1, "col": 1, "end_line": 1, "end_col": 7, "severity": "error",
+                                             "source": "rustc", "code": "E0308", "message": "mismatched types"}]}
+    require(answers["check-warning-with-error"] == warn_err,
+            f"an error found is returned though the check did not run for all: {answers['check-warning-with-error']}")
+    require(answers["check-health-ok"] == {"ok": True, "diagnostics": []},
+            f"check with ok health behaves as before: {answers['check-health-ok']}")
     require(answers["death-request"].get("ok") is False, "request interrupted by EOF must fail")
     for name in ("stopped", "dead", "failed-start"):
         require(answers[name].get("ok") is False and answers[name].get("gone") is True, f"{name} must report gone")
@@ -129,14 +143,15 @@ try:
     require(not running(process["pid"]) and not running(child), "stop must terminate server and child group")
     died = records("die")
     require(any(row == {"kind": "exit", "value": {"reason": "deliberate EOF"}} for row in died), "death fixture ran")
-    print("PASS goose-lsp standalone: 21 answers; initialization, configuration, framing, synchronization,")
+    print(f"PASS goose-lsp standalone: {len(answers)} answers; initialization, configuration, framing, synchronization,")
     print("diagnostics, implementations, graceful stop/group cleanup, EOF and failed executable,")
     print("error answers, a server that never reports indexing, death during diagnostics, encoded URIs,")
-    print("a rejected initialize, late indexing signals, a set for older text, pulled diagnostics.")
+    print("a rejected initialize, late indexing signals, a set for older text, pulled diagnostics,")
+    print("server health on check settle.")
     print(f"Evidence: {fixture}")
 finally:
     # Only fixture-owned process groups, including when a consumer assertion fails.
-    for mode in ("normal", "die", "quiet", "initfail", "late", "ij"):
+    for mode in ("normal", "die", "quiet", "initfail", "late", "ij", "health"):
         for row in records(mode):
             if row["kind"] == "process":
                 try:

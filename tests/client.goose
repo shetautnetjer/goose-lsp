@@ -99,6 +99,22 @@ fn main() {
     ask("pull-broken-again", "{\"op\":\"diagnostics\",\"file\":\"sample.ts\",\"settle\":\"pull\"}");
     golsp_stop();
 
+    // A check-settled server and its status: a check it says did not run,
+    // with nothing published, is not settled; a warning that leaves the check
+    // alone is a clean answer; an error found is returned either way; and ok
+    // is as before.
+    let health = server_args(a[2], a[3], "health", repo);
+    assert(write_file(str(repo, "/sample.ts"), "clean\n"));
+    assert(golsp_start(repo, str(repo, "/health.log"), "{}", health, "", "rust"));
+    ask("check-warning-unsettled", "{\"op\":\"diagnostics\",\"file\":\"sample.ts\",\"settle\":\"check\"}");
+    assert(write_file(str(repo, "/sample.ts"), "sysroot\n"));
+    ask("check-other-warning", "{\"op\":\"diagnostics\",\"file\":\"sample.ts\",\"settle\":\"check\"}");
+    assert(write_file(str(repo, "/sample.ts"), "broken\n"));
+    ask("check-warning-with-error", "{\"op\":\"diagnostics\",\"file\":\"sample.ts\",\"settle\":\"check\"}");
+    assert(write_file(str(repo, "/sample.ts"), "ok\n"));
+    ask("check-health-ok", "{\"op\":\"diagnostics\",\"file\":\"sample.ts\",\"settle\":\"check\"}");
+    golsp_stop();
+
     var absent: u8[>..] = [];
     absent.append(str(repo, "/no-such-server")); absent.push(0);
     assert(!golsp_start(repo, str(repo, "/absent.log"), "{}", absent, "", "typescript"));
